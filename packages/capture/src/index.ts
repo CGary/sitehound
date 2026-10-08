@@ -1,6 +1,7 @@
 import { chmod, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import type { Page } from "playwright";
+import { stripUrl } from "@sitehound/core";
 
 export interface PageCapture {
   html: string;
@@ -18,7 +19,9 @@ export async function capturePage(page: Page, outDir: string): Promise<PageCaptu
   await writeFile(files.html, await page.content(), { mode: 0o600 });
   await page.screenshot({ path: files.screenshot, fullPage: true });
   await chmod(files.screenshot, 0o600);
-  const meta = { url: page.url(), title: await page.title(), capturedAt: new Date().toISOString() };
+  const meta = { url: stripUrl(page.url()), title: await page.title(), capturedAt: new Date().toISOString() };
   await writeFile(files.meta, JSON.stringify(meta, null, 2), { mode: 0o600 });
   return files;
 }
+export * from "./text.ts";
+export * from "./element.ts";

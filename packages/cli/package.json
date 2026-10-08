@@ -5,6 +5,8 @@
   "type": "module",
   "exports": "./src/index.ts",
   "dependencies": {
-    "@sitehound/core": "workspace:*"
+    "@playwright/mcp": "^0.0.83",
+    "@sitehound/core": "workspace:*",
+    "playwright": "^1.63.0"
   }
 }

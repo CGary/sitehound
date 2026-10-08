@@ -2,19 +2,26 @@
 
 Task-agnostic browser harness (TypeScript + Playwright) to explore, test, analyze and clone websites. Users log in by hand once; the session is saved as a reusable **profile** and loaded by later runs.
 
+To USE sitehound as an agent (tests, scraping, component capture), follow AGENTS.md.
+
 ## Architecture
 
-- `packages/core` — task-agnostic: session/browser (`openSession`), profiles, paths (`ensurePrivateDir`, `assertSafeName`), task contract (`defineTask`, `createRunDir`). Must not contain task-specific logic.
+- `packages/core` — task-agnostic: session/browser (`openSession`), profiles, paths (`ensurePrivateDir`, `assertSafeName`), task contract (`defineTask`, `createRunDir`). `run.ts` (`runTask`) runs a task in a fresh session and always writes a redacted `result.json`; `session.ts` holds the heuristic session check (`checkSession`) and cookie stats; `redact.ts` strips query strings and fragments from recorded URLs and error messages; `trace.ts` + `zip.ts` turn a raw Playwright trace into a redacted `debug-trace.zip` + `steps.json` (`runTask({ trace })`, CLI `--trace`; the raw zip is parsed only there and always deleted). Must not contain task-specific logic.
 - `packages/capture` — reusable capture helpers (e.g. `capturePage`) that tasks compose.
-- `packages/cli` — `pnpm hound` entrypoint (`login`, `run`, `tasks`, `profiles`, `forget`).
+- `packages/cli` — `pnpm hound` entrypoint (`login`, `run`, `exec`, `check`, `mcp`, `tasks`, `profiles`, `forget`). `mcp.ts` wraps the official Playwright MCP server with a profile preloaded in memory.
 - `tasks/<name>/` — one workspace package per task, `index.ts` default-exports `defineTask({ name, description, run })`. Loaded dynamically by the CLI.
 
 ## Commands
 
+- `fnm use` — switch to the Node version in `.nvmrc` (reads `.nvmrc`; the Node version lives only there)
+- Agent shells may not load the fnm hook: prefix every command with `fnm exec --using=.nvmrc --` (e.g. `fnm exec --using=.nvmrc -- pnpm typecheck`). Install with `fnm exec --using=.nvmrc -- corepack pnpm install`; an engine error from pnpm means the wrong Node, not a dependency problem.
 - `corepack pnpm install` — install deps (also sets `core.hooksPath=.githooks`)
 - `pnpm typecheck` — `tsc -p tsconfig.json`; run before finishing any change
 - `pnpm browsers` — install Chromium for Playwright
-- `pnpm hound <login|run|tasks|profiles|forget> ...` — run the CLI
+- `pnpm hound <login|run|exec|check|mcp|tasks|profiles|forget> ...` — run the CLI
+- `pnpm hound exec <file.ts> <url> [--profile <name>]` — run a single-file script; writes `result.json`
+- `pnpm hound check <profile>` — is the saved session still valid? Exit 0 valid, 2 expired, 3 unknown
+- `pnpm hound mcp [--profile <name>] [--headed]` — Playwright MCP server over stdio, profile preloaded
 
 ## Conventions
 

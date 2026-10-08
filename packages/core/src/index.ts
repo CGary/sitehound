@@ -2,3 +2,8 @@ export * from "./paths.ts";
 export * from "./profiles.ts";
 export * from "./browser.ts";
 export * from "./task.ts";
+export * from "./redact.ts";
+export * from "./session.ts";
+export * from "./run.ts";
+export * from "./zip.ts";
+export * from "./trace.ts";

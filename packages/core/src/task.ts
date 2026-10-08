@@ -13,12 +13,23 @@ export interface TaskContext {
   /** Extra `--key value` flags passed after the URL. */
   args: TaskArgs;
   log(message: string): void;
+  /** Records a named assertion in result.json and returns `ok`. Any failed check makes the run fail. */
+  check(name: string, ok: boolean, detail?: string): boolean;
+}
+
+/** What a task may return. Written to result.json as status / summary / data. */
+export interface TaskResult {
+  /** Overrides the status derived from checks. */
+  status?: "pass" | "fail";
+  summary?: string;
+  /** Any JSON-serializable data worth keeping. */
+  data?: unknown;
 }
 
 export interface Task {
   name: string;
   description: string;
-  run(ctx: TaskContext): Promise<void>;
+  run(ctx: TaskContext): Promise<TaskResult | void>;
 }
 
 export const defineTask = (task: Task): Task => task;
