@@ -1,0 +1,11 @@
+{
+  "name": "@sitehound/capture",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "exports": "./src/index.ts",
+  "dependencies": {
+    "@sitehound/core": "workspace:*",
+    "playwright": "^1.63.0"
+  }
+}

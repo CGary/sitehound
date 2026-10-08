@@ -1,0 +1,33 @@
+{
+  "$schema": "https://json.schemastore.org/claude-code-settings.json",
+  "permissions": {
+    "allow": [
+      "Bash(pnpm typecheck)",
+      "Bash(pnpm hound:*)",
+      "Bash(corepack pnpm:*)",
+      "Bash(pnpm install)"
+    ],
+    "deny": [
+      "Read(./.hound/profiles/**)",
+      "Edit(./.hound/profiles/**)",
+      "Write(./.hound/profiles/**)",
+      "Read(./.env)",
+      "Edit(./.env)",
+      "Write(./.env)",
+      "Read(./.env.local)",
+      "Edit(./.env.local)",
+      "Write(./.env.local)",
+      "Read(./.env.*.local)",
+      "Edit(./.env.*.local)",
+      "Write(./.env.*.local)",
+      "Read(**/*.har)",
+      "Edit(**/*.har)",
+      "Write(**/*.har)",
+      "Read(**/trace*.zip)",
+      "Edit(**/trace*.zip)",
+      "Write(**/trace*.zip)",
+      "Bash(git commit --no-verify:*)",
+      "Bash(git push --force:*)"
+    ]
+  }
+}

@@ -1,0 +1,21 @@
+#!/bin/sh
+# Blocks commits that stage session state, captures or secrets.
+# Enabled automatically by `pnpm install` (core.hooksPath=.githooks).
+
+pattern='(^|/)\.hound/|(^|/)profiles/|(^|/)user-data|storage-?state|(^|/)cookies[^/]*\.json$|\.session\.json$|\.har(\.zip)?$|(^|/)trace[^/]*\.zip$|(^|/)traces/|\.wacz$|\.warc(\.gz)?$|(^|/)\.env($|\.)|\.(pem|key|p12|pfx|crt|kdbx)$|(^|/)\.npmrc$|(^|/)\.netrc$'
+
+bad=$(git diff --cached --name-only --diff-filter=ACMR | grep -E "$pattern" | grep -vE '(^|/)\.env\.example$')
+
+# Content scan: cookie/auth headers and common token shapes in staged text.
+leaks=$(git diff --cached -U0 --diff-filter=ACMR \
+  | grep -E '^\+' \
+  | grep -iE '"(cookie|set-cookie|authorization)"[[:space:]]*:|bearer [a-z0-9._-]{20,}|gh[pousr]_[A-Za-z0-9]{30,}|sk-[A-Za-z0-9_-]{20,}|AKIA[0-9A-Z]{16}' \
+  | head -5)
+
+if [ -n "$bad" ] || [ -n "$leaks" ]; then
+  echo "✋ sitehound pre-commit: possible sensitive data staged." >&2
+  [ -n "$bad" ] && printf '\nFiles:\n%s\n' "$bad" >&2
+  [ -n "$leaks" ] && printf '\nSuspicious lines:\n%s\n' "$leaks" >&2
+  printf "\nUnstage them (git restore --staged <file>). Bypass only if certain: git commit --no-verify\n" >&2
+  exit 1
+fi

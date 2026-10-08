@@ -1,0 +1,23 @@
+{
+  "name": "sitehound",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Task-agnostic browser harness to explore, test, analyze and clone websites — with reusable manual-login sessions.",
+  "type": "module",
+  "license": "MIT",
+  "packageManager": "pnpm@12.10.1",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "hound": "tsx packages/cli/src/index.ts",
+    "typecheck": "tsc -p tsconfig.json",
+    "browsers": "playwright install chromium",
+    "prepare": "git config core.hooksPath .githooks || true"
+  },
+  "devDependencies": {
+    "@types/node": "^22.20.5",
+    "tsx": "^4.23.15",
+    "typescript": "^7.0.2"
+  }
+}

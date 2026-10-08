@@ -1,0 +1,76 @@
+# ─────────────────────────────────────────────────────────────
+# SENSITIVE — never commit. Sessions, captures and secrets.
+# All runtime data lives in .hound/ (profiles, runs, traces).
+# The patterns below are defense in depth for anything that
+# ends up outside it.
+# ─────────────────────────────────────────────────────────────
+
+# Runtime data root (profiles, runs, downloads, traces)
+.hound/
+
+# Browser sessions: storage state, cookies, persistent user data dirs
+**/profiles/
+**/user-data*/
+**/*storage-state*.json
+**/*storageState*.json
+**/*.session.json
+**/cookies*.json
+**/auth*.json
+!**/tsconfig*.json
+
+# Captures that embed cookies, tokens or private content
+**/*.har
+**/*.har.zip
+**/trace*.zip
+**/traces/
+**/*.wacz
+**/*.warc
+**/*.warc.gz
+**/downloads/
+**/runs/
+**/output/
+**/screenshots/
+
+# Secrets
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+*.crt
+*.kdbx
+.npmrc
+.netrc
+
+# Claude Code — personal / machine-local
+.claude/settings.local.json
+.claude/CLAUDE.local.md
+CLAUDE.local.md
+
+# Playwright test artifacts
+playwright-report/
+test-results/
+blob-report/
+playwright/.cache/
+
+# Dependencies & build
+node_modules/
+dist/
+*.tsbuildinfo
+.pnpm-store/
+coverage/
+
+# Logs
+*.log
+npm-debug.log*
+pnpm-debug.log*
+
+# OS / editors
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/*
+!.vscode/extensions.json
+*.swp
