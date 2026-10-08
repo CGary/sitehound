@@ -1,0 +1,25 @@
+#!/bin/sh
+# hound: run the sitehound CLI from anywhere. Resolves the repo root from this script's own path
+# and never changes the caller's cwd (relative --file / --output paths resolve against it).
+set -e
+self=$0
+while [ -h "$self" ]; do
+  dir=$(cd "$(dirname "$self")" && pwd)
+  self=$(readlink "$self")
+  case $self in /*) ;; *) self=$dir/$self ;; esac
+done
+ROOT=$(cd "$(dirname "$self")/.." && pwd)
+ENTRY=$ROOT/packages/cli/src/index.ts
+
+if command -v fnm >/dev/null 2>&1 && [ -f "$ROOT/.nvmrc" ]; then
+  exec fnm exec --using="$ROOT/.nvmrc" -- node "$ENTRY" "$@"
+fi
+
+if [ -f "$ROOT/.nvmrc" ]; then
+  want=$(tr -d 'v \n\r' < "$ROOT/.nvmrc")
+  have=$(node -v 2>/dev/null | tr -d 'v \n\r')
+  if [ "$have" != "$want" ]; then
+    echo "hound: warning: fnm not found; running Node ${have:-<none>} but .nvmrc pins $want" >&2
+  fi
+fi
+exec node "$ENTRY" "$@"

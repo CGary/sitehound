@@ -2,7 +2,7 @@ import { chmod, readdir, rename, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { openSession } from "./browser.ts";
 import { ensurePrivateDir } from "./paths.ts";
-import { readProfileMeta } from "./profiles.ts";
+import { pickSite, readProfileMeta } from "./profiles.ts";
 import { redactData, redactText, stripUrl } from "./redact.ts";
 import { checkSession, profileCookieStats, type SessionCheck, type CookieStats } from "./session.ts";
 import type { Task, TaskArgs, TaskResult } from "./task.ts";
@@ -193,7 +193,7 @@ export async function runTask(opts: RunOptions): Promise<RunResult> {
       }
 
       if (profile) {
-        result.session = { ...(await checkSession(page, readProfileMeta(profile))), ...profileCookieStats(profile) };
+        result.session = { ...(await checkSession(page, pickSite(readProfileMeta(profile), page.url()))), ...profileCookieStats(profile) };
         if (result.session.state === "expired" && result.status === "pass") {
           result.status = "fail";
           result.summary = `session looks expired: ${result.session.reason}`;

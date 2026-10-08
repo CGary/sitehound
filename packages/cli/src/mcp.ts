@@ -1,7 +1,6 @@
 import { spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
-import { chromium } from "playwright";
-import { createRunDir, defaultHeadless, hasProfile, profilePath } from "@sitehound/core";
+import { HoundError, createRunDir, defaultHeadless, hasProfile, profilePath } from "@sitehound/core";
 
 export interface McpOptions {
   /** Saved login to preload (in memory only; the profile file is never modified). */
@@ -17,9 +16,14 @@ export interface McpOptions {
  */
 export async function runMcp({ profile, headed, extraArgs }: McpOptions): Promise<void> {
   if (profile && !hasProfile(profile)) {
-    throw new Error(`Profile "${profile}" not found. Create it with: pnpm hound login <url> --profile ${profile}`);
+    throw new HoundError("PROFILE_NOT_FOUND", `Profile "${profile}" not found.`, {
+      field: "profile",
+      received: profile,
+      suggestedFix: `hound profile login --profile ${profile} --url <url> --json`,
+    });
   }
 
+  const { chromium } = await import("playwright");
   const cliEntry = fileURLToPath(import.meta.resolve("@playwright/mcp/package.json")).replace(/package\.json$/, "cli.js");
   const outDir = await createRunDir("mcp");
 

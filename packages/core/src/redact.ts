@@ -56,15 +56,34 @@ function stripUrlsIn(text: string): string {
     .replace(/((?:href|src|action|url)\s{0,8}[=(]\s{0,8}["']?[^\s"'<>?#)]{0,2048})[?#][^\s"'<>)]*/gi, "$1");
 }
 
-/** Strips query/fragment from every URL inside free text, masks tokens, and truncates it. */
+const SECRET_KEY = "pass(?:word|wd)?|secret|token|api[_-]?key|auth|session|cookie|credential";
+const REDACTED = "[redacted]";
+/** `key=value`, `key: value`, `"key":"value"` where the key (up to 40 chars either side of the keyword) looks secret. */
+const SECRET_PAIR_RE = new RegExp(
+  `(["']?[\\w.-]{0,40}?(?:${SECRET_KEY})[\\w.-]{0,40}["']?\\s{0,8}[:=]\\s{0,8})(?:"[^"\\n]{0,4096}"|'[^'\\n]{0,4096}'|\\[(?:token|redacted)\\]|(?:(?:basic|digest|negotiate)\\s{1,8})?[^\\s,;&"'{}\\[\\]]{1,4096})`,
+  "gi",
+);
+/** A cookie header holds several `a=b; c=d` pairs: redact the rest of the line. */
+const COOKIE_LINE_RE = /(\b(?:set-)?cookie["']?\s{0,8}[:=]\s{0,8})[^\n]{1,4096}/gi;
+
+/** Replaces the value of secret-looking `key=value` / `key: value` / `"key":"value"` pairs with "[redacted]". */
+export function scrubSecretPairs(text: string): string {
+  const s = text.length > MAX_INPUT ? text.slice(0, MAX_INPUT) + CUT_MARKER : text;
+  return s.replace(COOKIE_LINE_RE, `$1${REDACTED}`).replace(SECRET_PAIR_RE, (m: string, head: string) => {
+    const q = m.charAt(head.length);
+    return q === '"' || q === "'" ? `${head}${q}${REDACTED}${q}` : `${head}${REDACTED}`;
+  });
+}
+
+/** Strips query/fragment from every URL inside free text, masks tokens and secret pairs, and truncates it. */
 export function redactText(text: string, max = 500): string {
-  const clean = scrubTokens(stripUrlsIn(text));
+  const clean = scrubSecretPairs(scrubTokens(stripUrlsIn(text)));
   return clean.length > max ? `${clean.slice(0, max)}…` : clean;
 }
 
 /** Deep copy of a JSON-like value with URLs in every string stripped of query/fragment. */
 export function redactData(value: unknown, depth = 0): unknown {
-  if (typeof value === "string") return stripUrlsIn(value);
+  if (typeof value === "string") return scrubSecretPairs(stripUrlsIn(value));
   if (depth > 20 || value === null || typeof value !== "object") return value;
   if (Array.isArray(value)) return value.map((v) => redactData(v, depth + 1));
   return Object.fromEntries(Object.entries(value).map(([k, v]) => [k, redactData(v, depth + 1)]));

@@ -33,11 +33,11 @@ function parseStates(raw: string | boolean | undefined): ElementState[] {
 export default defineTask({
   name: "component",
   description:
-    'Captures a UI component (screenshot, HTML, non-default computed styles, assets, hover/focus states) per viewport. Flags (use =): --selector="<css>" [--viewports=375,768,1280] [--states=hover,focus].',
+    'Captures a UI component (screenshot, HTML, non-default computed styles, assets, hover/focus states) per viewport. Args: --arg selector=<css> [--arg viewports=375,768,1280] [--arg states=hover,focus].',
   async run({ page, url, outDir, args, log }) {
     const selector = args.selector;
     if (typeof selector !== "string" || !selector.trim()) {
-      throw new Error('Missing --selector="<css>" (the component to capture)');
+      throw new Error('Missing --arg selector=<css> (the component to capture)');
     }
     const viewports = parseViewports(args.viewports);
     const states = parseStates(args.states);

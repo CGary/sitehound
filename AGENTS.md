@@ -1,139 +1,115 @@
-# AGENTS.md — using sitehound
+# AGENTS.md: using sitehound
 
-sitehound is a Playwright/TypeScript harness in this repo. It opens a browser, optionally loads a saved login (a **profile**), runs your code against the page, and writes a private, structured result. You are handed this repo path and a goal; this file tells you how to reach it.
+sitehound drives a Chromium browser from a CLI. It can read public pages, read or act on logged-in sites (through a saved **profile**), run tests, and capture components. Every command prints one JSON object, so you never need to parse human text.
 
-## Use cases
+## When to use sitehound
 
-1. **E2E tests** requested in natural language: turn the request into a script, run it, report pass/fail with evidence.
-2. **Studying or imitating components and pages**: capture a component's HTML, computed styles, assets and states per viewport, then rebuild it.
-3. **Reading information from sites**, including logged-in ones: capture clean text or return extracted data.
+- Read or browse a website step by step, including logged-in sites.
+- Run an end-to-end test or an extraction script with a structured result.
+- Capture a UI component (HTML, computed styles, assets, hover and focus states) for study or rebuilding.
+- Check whether a saved login is still valid.
+
+Do not use it for plain HTTP requests, API calls, or sites you are not authorized to automate. The detailed how-to is in `.claude/skills/sitehound/SKILL.md`.
 
 ## Running commands
 
-Run every project command with the Node version pinned in `.nvmrc` (22.22.2). Agent shells are often non-interactive and may not load the fnm shell hook, so they can silently run another Node. Either prefix each command:
+Run the CLI from the repo as `bin/hound` (or `/home/gary/dev/sitehound/bin/hound` from anywhere). The wrapper pins Node from `.nvmrc` through fnm, works from any directory, and keeps runtime data in the repo's `.hound/`. `pnpm hound` also works. The old commands (`login`, `run`, `exec`, `check`, `tasks`, `profiles`, `forget`) are deprecated aliases; use the domain commands below.
 
-```sh
-fnm exec --using=.nvmrc -- pnpm typecheck
-fnm exec --using=.nvmrc -- pnpm hound tasks
-fnm exec --using=.nvmrc -- pnpm hound exec .hound/scripts/home-h1.ts https://example.com
+If fnm is missing, `bin/hound` runs the current Node and prints a warning on stderr. Report that in your summary.
+
+Install dependencies once with `corepack pnpm install`. If pnpm fails with an engine error, you are on the wrong Node.
+
+## Default agent flags
+
+- Always pass `--json` (it is also the default when stdout is not a TTY).
+- Always pass `--no-input`. The CLI never prompts when this is set.
+- Read `--schema` for a command's inputs, enums and examples. Do not read long `--help` output.
+- Use `--output <file>` (on `page snapshot` and `page screenshot`) or read `data.file` for large results. `--output` fails with `CONFLICT` if the file exists (add `--if-exists overwrite`) and refuses directories and symlinks. Do not `cat` big files; use `head -c 20000`.
+- A value that starts with `-` must be passed as `--flag=value` (for example `--value=-5`).
+- Prefer `--actions read` (the default for `browser open`). Use `--actions interact` only when the user asked you to submit or change something.
+- Use `--timeout <seconds>` for slow pages. A `TIMEOUT` on a state-changing action (navigate, click, fill, select, press, back, forward, reload, tabs new/close) returns `retryable: false`: it may still have been applied. Run `page snapshot` before retrying.
+
+## Output envelope
+
+stdout holds exactly one JSON object.
+
+Success:
+
+```json
+{ "ok": true, "command": "page.navigate", "summary": "...", "data": {}, "next_actions": [{ "command": "...", "reason": "..." }] }
 ```
 
-or run `fnm use` once in the same shell, then use plain `pnpm`. If fnm is not installed, use any Node that matches `.nvmrc` and say so in your report.
+`next_actions` has at most 3 complete, runnable commands.
 
-Install dependencies with `fnm exec --using=.nvmrc -- corepack pnpm install`. If pnpm fails with an engine error (`engineStrict` is on), you are on the wrong Node. Switch to the pinned version. It is not a dependency problem.
+Error:
 
-Every `pnpm ...` example in this file assumes the fnm-pinned Node.
-
-## Choosing a mode
-
-- Repeatable test or report with a structured result: **`exec` script** (`pnpm hound exec`).
-- Exploring a page step by step, clicking around, deciding the next step from what you see: **`mcp`** (interactive Playwright MCP server).
-- Read a page as text or capture a component with no custom logic: **built-in tasks** (`snapshot`, `component`), via `pnpm hound run`.
-- Need a logged-in session: check it first (see Profiles). Every mode above accepts `--profile`.
-
-## Workflow: E2E test
-
-1. Write `.hound/scripts/<name>.ts`. No imports are needed. Default-export an async function `(ctx) => { summary?, data? } | void`. Use `ctx.page`, `ctx.url`, `ctx.log(msg)`, and `ctx.check(name, ok, detail?)`, which records an assertion. Any failed check fails the run.
-2. Run it: `pnpm hound exec .hound/scripts/<name>.ts <url> [--profile <name>] [--headed]`. Exit code: `0` pass, `1` fail or error.
-3. Read `result.json` in the printed run directory (`.hound/runs/exec-<name>/<timestamp>/`):
-   - `status`: `pass`, `fail`, or `error` (the script threw, or the browser could not start).
-   - `summary`: one-line result. `checks[]`: each `{name, ok, detail?}`.
-   - `data`: whatever the script returned.
-   - `error`: the message if status is `error`.
-   - `consoleErrors[]`, `pageErrors[]`: browser console errors and uncaught page exceptions.
-   - `failedRequests[]`: requests that failed, or responses with HTTP >= 400 (URLs have query strings removed).
-   - `session`: present only with `--profile`; `state` is `valid`, `expired` or `unknown`, with a `reason`. An `expired` session turns a passing run into `fail`.
-   - `files`: every file in the run directory.
-4. If status is not `pass`, read `failure.png` (screenshot taken at the end of the run) and `text.md` only if the script wrote it. Report the failing check names and details.
-
-Minimal complete example, `.hound/scripts/home-h1.ts`:
-
-```ts
-export default async function ({ page, url, check }) {
-  const response = await page.goto(url, { waitUntil: "load" });
-  check("HTTP 2xx", response?.ok() === true, `status ${response?.status()}`);
-  const h1 = page.getByRole("heading", { level: 1 });
-  check("h1 is visible", await h1.isVisible());
-  return { summary: "Home page shows a visible h1" };
-}
+```json
+{ "ok": false, "command": "element.click", "error": { "code": "REF_NOT_FOUND", "message": "...", "field": "ref", "received": "e999", "allowed": [] }, "retryable": true, "suggested_fix": { "command": "..." } }
 ```
 
-Run: `pnpm hound exec .hound/scripts/home-h1.ts https://example.com`
+`field`, `received` and `allowed` appear only when they apply. `data` may hold partial results.
 
-A failed check always fails the run. A returned `status` can only turn a pass into `"fail"`, never hide a failed check. String values in `data` have query strings and fragments stripped from URLs.
+Exit codes: `0` success, `2` usage error (`UNKNOWN_COMMAND`, `INVALID_ARGUMENT`, `MISSING_REQUIRED_FLAG`, `INVALID_ENUM`, `CONFIRMATION_REQUIRED`), `1` any other error (including `RUN_FAILED` and `RUN_ERROR`).
 
-## Debugging with a clean trace
+`profile check` exits `0` when it succeeds. Read `data.state` (`valid`, `expired`, `unknown`).
 
-Add `--trace` to `run` or `exec` (or `--trace on-failure` to keep it only when the run is not a `pass`). The run directory then gets two extra files and `result.json` gets a `trace` field:
+## Common commands
 
-- `steps.json`: read this first. `actions[]` in order, each `{ id, title, api, selector?, params, startTime, durationMs, error? }` (times in ms from the start of the run), plus `consoleErrors[]` (error and warning text only, 300 characters at most) and `pageErrors[]`. Every typed or selected value shows as `[redacted]`, and `evaluate` expressions and init scripts are removed.
-- `debug-trace.zip`: the cleaned Playwright trace (DOM snapshots with form values blanked, no screenshots; `failure.png` is separate). A human can open it with `pnpm exec playwright show-trace <path>`. Do not unzip it to read entries; use `steps.json`.
-- `result.json` → `trace`: `{ file, steps, actions, redactions: { headers, cookies, bodies, inputValues, urls } }`, or `{ error }` if the trace could not be cleaned (then no trace files exist).
+Examples include `--json`; keep it on every call. Session names use letters, digits, `-`, `_` and `.`.
 
-The raw trace is never kept. Never record or read a raw trace yourself with `context.tracing` in a script; use `--trace`.
+1. Browse loop, interactive: `hound browser open --session-name shop --json`, then `hound page navigate --session-name shop --url https://example.com --json`.
+2. Read the page with element refs: `hound page snapshot --session-name shop --json`. Refs look like `e12` or `f3e4` (from the latest snapshot). Use `--limit-chars` to shorten inline output; the full text goes to `data.file`.
+3. Click by ref: `hound element click --session-name shop --ref e12 --json`. After any click or navigation, take a new snapshot before using refs again.
+4. Fill a form (only with interact): `hound browser open --session-name shop --actions interact --json`, then `hound element fill --session-name shop --ref e7 --value-file -` (read the value from stdin for secrets).
+5. Close when done: `hound browser close --session-name shop --json`. Idle sessions also close themselves after 30 minutes.
+6. Test with a script: `hound script run --file .hound/scripts/home-h1.ts --url https://example.com --profile work --json`. The script default-exports `async (ctx) => ({ summary?, data? })` and uses `ctx.page`, `ctx.url`, `ctx.check(name, ok, detail?)`, `ctx.log(msg)`, `ctx.args`. A failed check fails the run. Read `data.status`, `data.checks[]`, `data.files`, `data.runDir`.
+7. Capture a component: `hound task run --task component --url https://example.com --arg selector=<css> --arg viewports=375,1280 --arg states=hover,focus --json`. Read `data.files` for the files per viewport. Only `--arg key=value` works; `--selector=` is not a flag.
+8. Full-page snapshot task: `hound task run --task snapshot --url https://example.com --json`.
+9. Check a saved login: `hound profile check --profile work --json` (add `--site <origin>` to check one site). Read `data.state`.
+10. List what exists: `hound profile list --json`, `hound browser list --json`, `hound task list --json`.
 
-## Workflow: reading information
+Other useful verbs: `page wait --for text|url|ref|load --value <v>`, `page scroll`, `page tabs`, `page screenshot`, `element hover|select|press`, `element type` (real key events, for search-as-you-type fields; interact), `element download` (click and save the file; `data.file`), `diag console`, `diag network` (failed requests by default; each has an `index`), `diag request --index <n> --part request-body|response-body` (redacted body, never headers; the last 500 requests are kept). Run `hound <domain> <verb> --schema` for flags.
 
-- Cheap, full view of one page: `pnpm hound run snapshot <url> [--profile <name>]`. Read `text.md` (title, URL without query, visible body text) and `aria.yml` (accessibility tree). Do not read `page.html` unless you need markup; it is large. Other files: `screenshot.png`, `meta.json`, and `result.json`.
-- Extracting specific fields: write an `exec` script that returns them in `data`, then read `result.json` → `data`. This is the preferred route for structured output.
+## Error handling
 
-## Workflow: components
+- Follow `suggested_fix.command` when present. Replace the quoted placeholders (for example `--ref "<ref>"`) yourself. For `INVALID_ENUM` the fix is the nearest allowed value; when nothing is close there is no fix, read `error.allowed`.
+- Ranges and patterns are checked before anything runs (`--schema` lists them, exit 2): `--limit-chars` 1..200000, `--depth` 0..1000, `--limit` 1..500, `--idle-timeout` 1..1440, names `^[a-z0-9][a-z0-9._-]{0,63}$` (case-insensitive).
+- `CONFIRMATION_REQUIRED` (exit 2): `profile delete` needs `--dry-run` or `--yes`; `profile login` on an existing profile needs an explicit `--mode extend|replace`. Pick one of `data.alternatives`.
+- `TIMEOUT` on a state-changing action: the action may have been applied. `page snapshot` first, then decide.
+- `REF_NOT_FOUND`: the page changed. Run `page snapshot` again and use the new refs.
+- `ACTION_BLOCKED`: the session is read-only. Do not reopen it with `--actions interact` on your own. Ask the user first, then close and reopen it.
+- `NO_TTY` from `profile login` (not retryable; the message holds the command for the human), or a profile that checks `expired`: stop and ask the human to log in. Agents cannot log in. Do not try to re-authenticate.
+- `SESSION_NOT_FOUND`: run `browser list` and open the session again.
+- `PROFILE_NOT_FOUND`: run `profile list`; do not guess names.
+- `RUN_FAILED`: a check failed. Read `data.checks[]` and the failure files in `data.runDir`.
+- `RUN_ERROR`: the run threw. Read `data.summary` and `result.json` in `data.runDir`.
+- `retryable: false`: fix the input before retrying.
+- Report the error code and the next step to the user. Do not paste page content into the report.
 
-Run:
+## Read level and what it blocks
 
-```sh
-pnpm hound run component <url> --selector "<css>" --viewports 375,768,1280 --states hover,focus [--profile <name>]
-```
+Browser sessions default to `--actions read`. It allows navigation, reading, screenshots, scrolling, hovering, waits, tabs, diagnostics, and clicks on real http(s) links (not `#fragment` links) and `<summary>`. It blocks fills, selects, key presses, and clicks on buttons, submit controls or anything inside a form (`ACTION_BLOCKED`). GET links with side effects (such as `/logout`) are not detected: do not click them blindly.
 
-Flags use `=` or a space. `--viewports` defaults to `1280`; `--states` accepts `hover` and `focus` (optional). The selector must match a visible element, or the run errors.
-
-Output in `.hound/runs/component/<timestamp>/`:
-
-- `result.json` → `data.files` lists the files per viewport.
-- `<width>/page.png`: full-page screenshot at that width.
-- `<width>/element.png`: screenshot of the element. Use it as the visual reference.
-- `<width>/element.html`: the element's `outerHTML`. Structure and text.
-- `<width>/styles.json`: a tree of nodes (`id`, `parent`, `selector`, computed styles that differ from the browser default, `box`, `pseudo`), plus `customProperties` (CSS variables). Capped at 300 nodes; `truncated` tells you if it was cut.
-- `<width>/assets.json`: URLs the element uses (images, fonts, backgrounds), without query strings. `data:` URLs are summarized.
-- `<width>/element.hover.png`, `<width>/styles.hover.json` (and `focus`): the state screenshot, plus the style changes against the base state. Focus files include `focusTarget`.
-
-To rebuild: write the markup from `element.html`, map the `styles.json` values to CSS (keep the node tree, and use the custom properties), reference the assets, then compare your rebuild against `element.png` at each width. Use the `hover`/`focus` diffs for the states. `styles.json` gives computed values, not the original source CSS, so expect to simplify. Do not download or reuse assets from sites you are not authorized to copy.
-
-## Profiles and sessions
-
-- Agents cannot log in. A human runs `pnpm hound login <url> --profile <name>`, signs in by hand in the window that opens, and presses Enter. Ask for this when needed.
-- Before any logged-in job, run `pnpm hound check <profile>`. It navigates to the saved landing page, then prints `valid: …`, `expired: …` or `unknown: …` and cookie counts. Exit codes: `0` valid, `2` expired, `3` unknown. Exit `1` means the profile or its metadata is missing, or an error occurred.
-- If the check exits `2` (expired), stop and ask the human to log in again. Do not try to re-authenticate.
-- If the check exits `3` (unknown), you may continue, but report that the session could not be confirmed.
-- Every `run`/`exec` with `--profile` records `session` in `result.json`. That state is judged from the page at the end of the run, so a script that navigates away can make it `unknown`.
-- `pnpm hound mcp --profile <name>` preloads the profile in memory. The profile file is not modified.
-
-## Interactive exploration: `mcp`
-
-Register once (the `--silent` flag keeps stdout clean for the protocol):
-
-```sh
-claude mcp add sitehound -- pnpm --silent --dir /path/to/sitehound hound mcp --profile <name>
-```
-
-Omit `--profile` for anonymous browsing. `--headed` shows a window. Screenshots and other artifacts go to `.hound/runs/mcp/<timestamp>/`. Flags after a standalone `--` go to `@playwright/mcp`.
-
-The server exposes all of its tools, including `browser_evaluate`, `browser_network_requests` and `browser_file_upload`. There is no flag to disable them in this version. Apply the rules below to them as you would to any script: do not dump cookies, storage or headers, and do not upload local files that are not needed for the task.
-
-## Rules for agents (hard)
+## Privacy and hard rules
 
 - NEVER read, print, copy or summarize `.hound/profiles/`, `.env` files, HAR files or Playwright traces. This includes `cat`, `grep` and pasting them into output.
-- NEVER echo page content, cookies or headers to the console. Put results in `result.json` (`summary`, `data`), not in logs.
-- Write outputs only under `.hound/` (use `pnpm hound` commands and the `ctx.outDir` directory). Never commit `.hound/`.
+- NEVER echo page content, cookies or headers to the console. Put results in the JSON envelope or in run files, not in logs.
+- Write outputs only through the CLI (under `.hound/`). Never commit `.hound/`.
 - Respect each site's terms of service, `robots.txt` and copyright.
 - Automate only sites the user owns or is authorized to use.
-- Privacy: reading run outputs of logged-in pages (tax, banking, health, or other sensitive data) sends that content to the AI model provider. Confirm with the user before reading such outputs.
+- Privacy: run outputs of logged-in pages (tax, banking, health or other sensitive data) are sent to the AI model provider when you read them. Confirm with the user before reading such outputs.
 
 ## Known limitations
 
 - `sessionStorage` is not saved in profiles. localStorage and IndexedDB are.
+- The read-level rules are heuristics. A link can have side effects in JavaScript, or be a GET link such as `/logout`, and a read session may still click it.
+- Shadow DOM content may not appear in snapshots or be reachable by ref. Check with a screenshot or a script.
 - The expiry check is a heuristic (password fields, login-looking URLs, origin changes). It can be wrong.
 - No bot-detection evasion. Some sites will block or challenge automated browsers.
 - Chromium only.
-- No full HAR capture. `failedRequests` in `result.json` lists failures and HTTP >= 400 responses only. The clean trace lists requests without headers, cookies, bodies or query strings.
-- A clean trace keeps visible page text, the page title and URL origins and paths as recorded (no screenshots, no form values, no query strings, no non-error console text); treat it as private run output.
+- No full HAR capture. `diag network` and `failedRequests` list failures and HTTP >= 400 responses only. Clean traces list requests without headers, cookies, bodies or query strings.
+- A clean trace keeps visible page text, the page title and URL origins and paths as recorded (no screenshots, no form values, no query strings, no non-error console text). Treat it as private run output.
+
+## Deprecated
+
+`mcp` (the Playwright MCP server, `bin/hound mcp`) still works but is deprecated. Use the CLI commands above instead.

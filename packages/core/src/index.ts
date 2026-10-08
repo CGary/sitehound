@@ -7,3 +7,5 @@ export * from "./session.ts";
 export * from "./run.ts";
 export * from "./zip.ts";
 export * from "./trace.ts";
+export * from "./errors.ts";
+export * from "./browserd/index.ts";

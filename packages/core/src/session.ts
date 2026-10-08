@@ -1,6 +1,6 @@
 import { readFileSync } from "node:fs";
 import type { Page } from "playwright";
-import { profilePath, type ProfileMeta } from "./profiles.ts";
+import { profilePath, type ProfileSite } from "./profiles.ts";
 
 export interface SessionCheck {
   state: "valid" | "expired" | "unknown";
@@ -19,9 +19,9 @@ function parse(url: string): URL | undefined {
 
 /**
  * Heuristic session check on the page's current state (it does not navigate).
- * To verify a stored session, navigate to `meta.landingUrl` first.
+ * To verify a stored session, navigate to `site.landingUrl` first.
  */
-export async function checkSession(page: Page, meta?: ProfileMeta): Promise<SessionCheck> {
+export async function checkSession(page: Page, site?: ProfileSite): Promise<SessionCheck> {
   try {
     const cur = parse(page.url());
     if (!cur || (cur.protocol !== "http:" && cur.protocol !== "https:")) {
@@ -30,8 +30,8 @@ export async function checkSession(page: Page, meta?: ProfileMeta): Promise<Sess
     if (await page.locator("input[type=password]:visible").count()) {
       return { state: "expired", reason: "a password field is visible (login form)" };
     }
-    const login = meta && parse(meta.loginUrl);
-    const landing = meta && parse(meta.landingUrl);
+    const login = site && parse(site.loginUrl);
+    const landing = site && parse(site.landingUrl);
     if (login && landing) {
       if (login.pathname !== landing.pathname && cur.origin === login.origin && cur.pathname === login.pathname) {
         return { state: "expired", reason: "redirected to the login URL" };
@@ -42,7 +42,7 @@ export async function checkSession(page: Page, meta?: ProfileMeta): Promise<Sess
       if (cur.origin === landing.origin) return { state: "valid", reason: "on the landing origin, no login indicators" };
       return { state: "unknown", reason: "page left the landing origin" };
     }
-    return { state: "unknown", reason: meta ? "profile meta is incomplete" : "no profile meta; no login indicators found" };
+    return { state: "unknown", reason: site ? "profile meta is incomplete" : "no profile meta; no login indicators found" };
   } catch {
     return { state: "unknown", reason: "could not inspect the page" };
   }
