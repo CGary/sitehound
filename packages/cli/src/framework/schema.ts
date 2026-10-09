@@ -28,6 +28,7 @@ export function commandSchema(cmd: Command): unknown {
     input: {
       required: Object.entries(cmd.flags).filter(([, s]) => s.required).map(([n]) => n),
       ...((cmd.requires?.length || cmd.confirm?.length) && { one_of: [...(cmd.requires ?? []), ...(cmd.confirm ?? []).map((c) => c.oneOf)] }),
+      ...(cmd.requiresAny?.length && { any_of: cmd.requiresAny }),
       ...(cmd.confirm?.length && { confirmation_required: cmd.confirm.map((c) => ({ one_of: c.oneOf, message: c.message })) }),
       ...(cmd.requiresWhen?.length && { conditional: cmd.requiresWhen }),
       ...(cmd.costRules?.length && {

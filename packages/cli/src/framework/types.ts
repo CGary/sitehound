@@ -111,6 +111,8 @@ export interface Command {
   flags: Record<string, FlagSpec>;
   /** Exactly-one-of groups of flag names, e.g. [["value", "value-file"]]. */
   requires?: readonly (readonly string[])[];
+  /** At-least-one-of groups (several may be given), e.g. [["color-scheme", "media", "reset"]]. */
+  requiresAny?: readonly (readonly string[])[];
   /** Conditional requirements, e.g. { when: { scope: "element" }, require: ["ref"] }. */
   requiresWhen?: readonly ConditionalRule[];
   /**

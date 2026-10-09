@@ -51,6 +51,7 @@ export function commandHelp(cmd: Command): string {
   if (!entries.length) lines.push("  (none)");
   for (const [n, s] of entries) lines.push(flagLine(n, s));
   for (const g of [...(cmd.requires ?? []), ...(cmd.confirm ?? []).map((c) => c.oneOf)]) lines.push(`  exactly one of: ${g.map((n) => `--${n}`).join(" | ")}`);
+  for (const g of cmd.requiresAny ?? []) lines.push(`  at least one of: ${g.map((n) => `--${n}`).join(" | ")}`);
   for (const r of cmd.requiresWhen ?? []) {
     const when = Object.entries(r.when).map(([k, v]) => `--${k} ${Array.isArray(v) ? v.join("|") : v}`).join(" and ");
     if (r.require?.length) lines.push(`  with ${when}: requires ${r.require.map((n) => `--${n}`).join(", ")}`);

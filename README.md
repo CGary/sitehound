@@ -57,9 +57,9 @@ The CLI is `bin/hound <domain> <verb> [flags]`. Every command prints one JSON ob
 | Domain    | Verbs                                                                 | Purpose                                              |
 | --------- | --------------------------------------------------------------------- | ---------------------------------------------------- |
 | `browser` | `open`, `close`, `list`, `status`                                     | Persistent browser sessions                          |
-| `page`    | `navigate`, `snapshot`, `screenshot`, `wait`, `back`, `forward`, `reload`, `scroll`, `tabs` | Move around and read the current page |
-| `element` | `click`, `hover`, `fill`, `type`, `select`, `press`, `download`       | Act on an element by its ref                         |
-| `diag`    | `console`, `network`, `request`, `trace`                              | Errors, requests, redacted request bodies and the clean trace of a session |
+| `page`    | `navigate`, `snapshot`, `find`, `screenshot`, `wait`, `back`, `forward`, `reload`, `scroll`, `tabs`, `resize`, `emulate` | Move around, read and resize the current page |
+| `element` | `click`, `drag`, `read`, `hover`, `fill`, `type`, `select`, `press`, `upload`, `download` | Act on or read an element by its ref |
+| `diag`    | `console`, `dialogs`, `network`, `request`, `trace`                   | Errors, handled dialogs, requests, redacted request bodies and the clean trace of a session |
 | `profile` | `list`, `check`, `login`, `delete`                                    | Saved logins                                         |
 | `task`    | `list`, `run`                                                         | Built-in capture tasks (`snapshot`, `component`)     |
 | `script`  | `run`                                                                 | Single-file test or extraction script                |
@@ -105,6 +105,11 @@ bin/hound browser close --session-name shop --json
 - `--profile <name>` opens the session with a saved login.
 - `--actions read` (the default) allows navigation, reading, screenshots, scrolling, waits, tabs, diagnostics, and clicks on real http(s) links and `<summary>` (GET links with side effects such as `/logout` are not detected). `--actions interact` also allows filling fields, selecting options, pressing keys and clicking buttons. Open with `interact` only when you need to submit or change something.
 - `--display headed` shows the window; `headless` is the default.
+- `--dialog dismiss` (the default) cancels JavaScript dialogs (alert, confirm, prompt, beforeunload) in every tab so none hangs a page; `--dialog accept` confirms them (for example "Delete this record?") and needs `--actions interact`. Override it per action with `--dialog` / `--dialog-text` on `element click|press|select|type|download|upload|drag` and `page navigate|back|forward|reload`; the override also covers a dialog raised by a timer or request up to 2 seconds after the action returned. `page navigate|back|forward|reload` always accept a `beforeunload` dialog, since leaving is what you asked for. Handled dialogs appear in the action's `data.dialogs`, and `diag dialogs` lists the last 100.
+- `element upload --ref <ref> --file <path> [--file ...]` (interact) sets files on an `<input type=file>` or on the button that opens the file chooser. It refuses sitehound's `.hound/`, `.env*`, HAR and trace files, SSH/cloud/docker/kube credentials, browser profiles, shell histories, password vaults and key files (`ACTION_BLOCKED`) as well as hard-linked files (copy them first), and caps a call at 20 regular files and 50 MiB.
+- `--viewport <W>x<H>` (200..7680 x 200..4320), `--device-scale-factor 1..4` and `--mobile` set the size, pixel ratio and touch/mobile emulation of every tab; `browser status` shows the viewport, and `page resize --viewport <W>x<H>` changes the active tab. `page emulate` sets `--color-scheme light|dark|no-preference`, `--media screen|print` and `--reduced-motion reduce|no-preference` (or `--reset`) for the active tab and for tabs opened later.
+- `page find --text <substring>|--regex </pattern/flags>` returns only the matching lines of a fresh snapshot, with line numbers and refs (`--limit 1..200`, `--context 0..3`); it is the cheap alternative to reading a whole snapshot, and its refs work with `element` commands. Regexes are capped (200 characters, 2000 per line) and run with a time budget. `element read --ref <ref> [--attr <name>] [--limit-chars 1..20000]` returns an element's text or one attribute with tokens masked and URL queries removed; password, hidden, card, OTP and CSRF-like fields are refused (`ACTION_BLOCKED`). `/url:` lines of snapshots lose their query strings. `element drag --ref <source> --to-ref <target>` (interact) drags and drops.
+- `page wait --for text-gone|ref-hidden` waits for a spinner to go away, `--within <ref>` scopes a text wait to one element, and `--for request --value <substring or /regex/flags>` (with `--method`, `--since-index`) waits for a request that finished after the last click, fill or navigation (the value is a substring, or `/regex/imsu` of at most 200 characters). `text-gone` and `ref-hidden` return `wasPresent: false` when the target was never visible. `element click` also takes `--count 1..3`, `--button` and `--modifiers` (interact).
 - A ref (like `e12` or `f3e4`) is valid only for the snapshot it came from. After a click or a navigation, take a new snapshot (`REF_NOT_FOUND` means the page changed).
 - Sessions close themselves after 30 minutes of inactivity (`--idle-timeout`, 1 to 1440 minutes, changes it). A `TIMEOUT` on a state-changing action may still have been applied: take a snapshot before retrying.
 - `--output <file>` (snapshot, screenshot) fails with `CONFLICT` if the file exists unless `--if-exists overwrite`; directories and symlinks are refused. Values that start with `-` need `--flag=value`.
@@ -246,7 +251,9 @@ Then ask the agent to browse, test or read a site, or invoke `/sitehound` explic
 
 - always pass `--json --no-input` and read flags with `--schema`;
 - open sessions at the read level and use `--actions interact` only when you asked it to change something;
-- use `element type` for search-as-you-type fields, `element download` for exported files, and `diag request` to inspect a redacted request or response body;
+- use `page find` to locate things without reading a whole snapshot, `element type` for search-as-you-type fields, `element read` for one element's text or attribute, `element download` for exported files, and `diag request` to inspect a redacted request or response body;
+- use `browser open --viewport`, `page resize` and `page emulate` to check responsive layouts, dark mode and print styles;
+- leave dialogs dismissed unless you asked for the action behind them, and upload only the files you named, never secrets;
 - leave captures in sitehound's private `.hound/runs/`, or write `--output` only to a `mktemp -d` dir or a git-ignored folder, never to tracked or shared paths;
 - stop and ask you when a login is needed or a profile has expired.
 

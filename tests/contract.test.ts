@@ -6,9 +6,9 @@ import { makeEnv, type Env } from "./helpers/hound.ts";
 /** The final command catalog (docs/cli contract). Every one must be registered. */
 const CATALOG = [
   "browser open", "browser close", "browser list", "browser status",
-  "page navigate", "page snapshot", "page screenshot", "page wait", "page back", "page forward", "page reload", "page scroll", "page tabs",
-  "element click", "element hover", "element fill", "element select", "element press", "element type", "element download",
-  "diag console", "diag network", "diag request", "diag trace",
+  "page navigate", "page snapshot", "page find", "page screenshot", "page wait", "page back", "page forward", "page reload", "page scroll", "page tabs", "page resize", "page emulate",
+  "element click", "element drag", "element read", "element hover", "element fill", "element select", "element press", "element type", "element download", "element upload",
+  "diag console", "diag network", "diag request", "diag dialogs", "diag trace",
   "profile list", "profile check", "profile login", "profile delete",
   "task list", "task run", "script run",
 ];
@@ -60,7 +60,7 @@ describe("cli contract", () => {
   it("--schema exposes enums, defaults and required flags", async () => {
     const wait = JSON.parse((await env.raw(["page", "wait", "--schema"])).stdout);
     assert.deepEqual(wait.input.required.sort(), ["for", "session-name"]);
-    assert.deepEqual(wait.input.properties.for.enum, ["text", "url", "ref", "load"]);
+    assert.deepEqual(wait.input.properties.for.enum, ["text", "text-gone", "url", "ref", "ref-hidden", "request", "load"]);
     const open = JSON.parse((await env.raw(["browser", "open", "--schema"])).stdout);
     assert.equal(open.kind, "session");
     assert.deepEqual(open.input.properties.actions.enum, ["read", "interact"]);
@@ -82,7 +82,7 @@ describe("cli contract", () => {
 
     const cmd = await env.raw(["page", "wait", "--help"]);
     assert.match(cmd.stdout, /--session-name/);
-    assert.match(cmd.stdout, /--for <text\|url\|ref\|load>/);
+    assert.match(cmd.stdout, /--for <text\|text-gone\|url\|ref\|ref-hidden\|request\|load>/);
     const examples = cmd.stdout.split("Examples:")[1]!.split("\n").filter((l) => l.trim());
     assert.equal(examples.length, 3);
     assert.ok(cmd.stdout.length < root.stdout.length * 3, "command help stays short");
@@ -115,7 +115,7 @@ describe("cli contract", () => {
     assert.equal(badEnum.json.error.code, "INVALID_ENUM");
     assert.equal(badEnum.json.error.field, "for");
     assert.equal(badEnum.json.error.received, "bogus");
-    assert.deepEqual(badEnum.json.error.allowed, ["text", "url", "ref", "load"]);
+    assert.deepEqual(badEnum.json.error.allowed, ["text", "text-gone", "url", "ref", "ref-hidden", "request", "load"]);
 
     const badInt = await env.hound(["page", "snapshot", "--session-name", "x", "--limit-chars", "abc"]);
     assert.equal(badInt.exitCode, 2);

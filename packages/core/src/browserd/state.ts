@@ -7,6 +7,7 @@ import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { HoundError } from "../errors.ts";
 import { RUNS_DIR, SESSIONS_DIR, assertSafeName } from "../paths.ts";
+import { DEVICE_SCALE_FACTOR_MAX, DEVICE_SCALE_FACTOR_MIN, VIEWPORT_MAX_HEIGHT, VIEWPORT_MAX_WIDTH, VIEWPORT_MIN_HEIGHT, VIEWPORT_MIN_WIDTH, viewportInBounds } from "./limits.ts";
 import type { BrowserOp, DaemonState } from "./types.ts";
 
 /** The daemon's entry script; also how a pid is recognised as ours (via /proc/<pid>/cmdline). */
@@ -111,7 +112,7 @@ export async function removeSessionDir(dir: string): Promise<void> {
   await rm(dir, { recursive: true, force: true });
 }
 
-const STATE_CHANGING_OPS = new Set<BrowserOp>(["navigate", "click", "fill", "select", "press", "type", "download", "back", "forward", "reload"]);
+const STATE_CHANGING_OPS = new Set<BrowserOp>(["navigate", "click", "fill", "select", "press", "type", "download", "upload", "drag", "back", "forward", "reload"]);
 
 /** Ops whose effect may have landed even if the caller saw a timeout (tabs: only new/close). */
 export function isStateChanging(op: BrowserOp, params: Record<string, unknown>): boolean {
@@ -128,6 +129,28 @@ export function assertIdleTimeout(minutes: unknown): void {
     throw new HoundError("INVALID_ARGUMENT", `--idle-timeout must be a number of minutes from ${IDLE_TIMEOUT_MIN} to ${IDLE_TIMEOUT_MAX}.`, {
       field: "idle-timeout",
       received: minutes,
+    });
+  }
+}
+
+/** Throws INVALID_ARGUMENT (field "viewport") unless width x height are integers within the viewport bounds. */
+export function assertViewport(width: unknown, height: unknown, field = "viewport"): void {
+  if (!viewportInBounds(width, height)) {
+    throw new HoundError(
+      "INVALID_ARGUMENT",
+      `--${field} must be WIDTHxHEIGHT in CSS pixels, width ${VIEWPORT_MIN_WIDTH}..${VIEWPORT_MAX_WIDTH} and height ${VIEWPORT_MIN_HEIGHT}..${VIEWPORT_MAX_HEIGHT} (e.g. 375x812).`,
+      { field, received: `${String(width)}x${String(height)}`, retryable: true },
+    );
+  }
+}
+
+/** Throws INVALID_ARGUMENT (field "device-scale-factor") unless the factor is an integer in 1..4. */
+export function assertDeviceScaleFactor(value: unknown): void {
+  if (typeof value !== "number" || !Number.isInteger(value) || value < DEVICE_SCALE_FACTOR_MIN || value > DEVICE_SCALE_FACTOR_MAX) {
+    throw new HoundError("INVALID_ARGUMENT", `--device-scale-factor must be an integer from ${DEVICE_SCALE_FACTOR_MIN} to ${DEVICE_SCALE_FACTOR_MAX}.`, {
+      field: "device-scale-factor",
+      received: value,
+      retryable: true,
     });
   }
 }

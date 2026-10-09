@@ -17,7 +17,9 @@ import {
   LOG_FILE,
   PID_FILE,
   STARTUP_ERROR_FILE,
+  assertDeviceScaleFactor,
   assertIdleTimeout,
+  assertViewport,
   isDaemonProcess,
   isPidAlive,
   isStateChanging,
@@ -49,7 +51,8 @@ const CLIENT_MARGIN_MS = 2_000;
 /** Liveness probe: a daemon that cannot answer a ping in this long (twice) is treated as not answering. */
 const PING_TIMEOUT_MS = 500;
 const OPS_WITH_TIMEOUT = new Set<BrowserOp>([
-  "navigate", "snapshot", "screenshot", "wait", "back", "forward", "reload", "tabs", "click", "hover", "fill", "select", "press", "type", "download", "request",
+  "navigate", "snapshot", "screenshot", "wait", "back", "forward", "reload", "tabs", "click", "hover", "fill", "select", "press", "type", "upload", "download", "request",
+  "drag", "find", "read",
 ]);
 
 const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
@@ -75,10 +78,14 @@ function infoFrom(state: DaemonConfig & { pid: number; startedAt: string }, aliv
     ...(state.profile ? { profile: state.profile } : {}),
     actions: state.actions,
     display: state.display,
+    dialog: state.dialog ?? "dismiss",
     trace: state.trace,
     startedAt: state.startedAt,
     idleTimeoutMinutes: state.idleTimeoutMinutes,
     alive,
+    ...(state.viewport ? { viewport: state.viewport } : {}),
+    ...(state.deviceScaleFactor !== undefined ? { deviceScaleFactor: state.deviceScaleFactor } : {}),
+    ...(state.mobile ? { mobile: true } : {}),
   };
 }
 
@@ -286,6 +293,7 @@ export async function callBrowserSession<T = unknown>(
   const p: Record<string, unknown> = { ...params };
   if (op === "snapshot" && typeof p.output === "string" && p.output) p.output = resolve(process.cwd(), p.output);
   if ((op === "screenshot" || op === "download" || op === "request") && typeof p.output === "string" && p.output) p.output = resolve(process.cwd(), p.output);
+  if (op === "upload" && Array.isArray(p.files)) p.files = p.files.map((f) => (typeof f === "string" ? resolve(process.cwd(), f) : f));
   // Typing takes chars x delay: unless the caller set a timeout, give the op the time that needs.
   if (op === "type" && opts.timeoutMs === undefined && p.timeoutMs === undefined && typeof p.value === "string") {
     p.timeoutMs = typingTimeoutMs(p.value.length, typeof p.delayMs === "number" ? p.delayMs : 30);
@@ -307,7 +315,19 @@ export async function openBrowserSession(opts: OpenBrowserSessionOptions): Promi
   if (opts.actions !== "read" && opts.actions !== "interact") throw invalidEnum("actions", opts.actions, ["read", "interact"]);
   if (opts.display !== "headless" && opts.display !== "headed") throw invalidEnum("display", opts.display, ["headless", "headed"]);
   if (opts.trace !== "off" && opts.trace !== "on") throw invalidEnum("trace", opts.trace, ["off", "on"]);
+  const dialog = opts.dialog ?? "dismiss";
+  if (dialog !== "accept" && dialog !== "dismiss") throw invalidEnum("dialog", dialog, ["accept", "dismiss"]);
+  if (dialog === "accept" && opts.actions !== "interact") {
+    throw new HoundError("INVALID_ARGUMENT", "--dialog accept needs --actions interact (accepting a dialog can confirm a deletion or a submission).", {
+      field: "dialog",
+      received: dialog,
+      allowed: ["dismiss"],
+      retryable: true,
+    });
+  }
   assertIdleTimeout(opts.idleTimeoutMinutes);
+  if (opts.viewport !== undefined) assertViewport(opts.viewport.width, opts.viewport.height);
+  if (opts.deviceScaleFactor !== undefined) assertDeviceScaleFactor(opts.deviceScaleFactor);
   if (profile !== undefined && !hasProfile(profile)) {
     throw new HoundError("PROFILE_NOT_FOUND", `Profile "${profile}" not found.`, {
       field: "profile",
@@ -325,8 +345,12 @@ export async function openBrowserSession(opts: OpenBrowserSessionOptions): Promi
     ...(profile ? { profile } : {}),
     actions: opts.actions,
     display: opts.display,
+    dialog,
     trace: opts.trace,
     idleTimeoutMinutes: opts.idleTimeoutMinutes,
+    ...(opts.viewport ? { viewport: { width: opts.viewport.width, height: opts.viewport.height } } : {}),
+    ...(opts.deviceScaleFactor !== undefined ? { deviceScaleFactor: opts.deviceScaleFactor } : {}),
+    ...(opts.mobile ? { mobile: true } : {}),
   };
   await writePrivateJson(join(dir, CONFIG_FILE), config);
 

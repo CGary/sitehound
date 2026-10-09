@@ -12,6 +12,11 @@ export interface SessionOptions {
   headless?: boolean;
   /** Private directory for downloads started by the page (default: a Playwright temp dir). It is emptied and removed on close. */
   downloadsPath?: string;
+  /** Viewport of every page (default: Playwright's 1280x720). */
+  viewport?: { width: number; height: number };
+  deviceScaleFactor?: number;
+  /** Mobile emulation: isMobile + hasTouch. */
+  mobile?: boolean;
 }
 
 export interface Session {
@@ -32,7 +37,7 @@ export function missingBrowserError(): HoundError {
 
 export const defaultHeadless = (): boolean => process.env.HOUND_HEADLESS !== "false";
 
-export async function openSession({ profile, headless = defaultHeadless(), downloadsPath }: SessionOptions = {}): Promise<Session> {
+export async function openSession({ profile, headless = defaultHeadless(), downloadsPath, viewport, deviceScaleFactor, mobile }: SessionOptions = {}): Promise<Session> {
   if (profile && !hasProfile(profile)) {
     throw new HoundError("PROFILE_NOT_FOUND", `Profile "${profile}" not found.`, {
       field: "profile",
@@ -57,6 +62,9 @@ export async function openSession({ profile, headless = defaultHeadless(), downl
   });
   const context = await browser.newContext({
     storageState: profile ? profilePath(profile) : undefined,
+    ...(viewport ? { viewport } : {}),
+    ...(deviceScaleFactor ? { deviceScaleFactor } : {}),
+    ...(mobile ? { isMobile: true, hasTouch: true } : {}),
   });
   return {
     browser,

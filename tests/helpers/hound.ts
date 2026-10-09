@@ -231,6 +231,172 @@ const PAGES: Record<string, string> = {
 <button id="b" onclick="location.href='/files/report.txt'">Export PDF</button>
 <button id="n" onclick="void 0">Do nothing</button>`,
   ),
+  // Dialogs: confirm, prompt, alert, a late alert (outside any op), a popup that alerts on load, Enter -> confirm.
+  "/dialogs": page(
+    "Dialogs",
+    `<h1>Dialogs</h1>
+<button onclick="out.textContent = confirm('¿Seguro que desea eliminar?') ? 'deleted' : 'kept'">Delete record</button>
+<button onclick="out.textContent = 'name:' + prompt('Your name?', 'anon')">Ask name</button>
+<button onclick="alert('Saved ok'); out.textContent = 'alerted'">Say saved</button>
+<button onclick="setTimeout(function () { alert('late notice'); out.textContent = 'late done'; }, 400)">Alert later</button>
+<button onclick="window.open('/dialog-popup')">Open popup</button>
+<label>Confirm field <input type="text" aria-label="Confirm field" onkeydown="if (event.key === 'Enter') out.textContent = confirm('Submit it?') ? 'submitted' : 'cancelled'"></label>
+<div id="out" role="status">idle</div>
+<script>var out = document.getElementById("out");</script>`,
+  ),
+  "/dialog-popup": page("Popup", `<h1>Popup</h1><script>alert("popup says hi"); document.title = "popup done";</script>`),
+  // Uploads: a plain input, a multiple input, and a button that opens a chooser for a hidden input.
+  "/upload": page(
+    "Upload",
+    `<h1>Upload</h1>
+<label>Photo <input type="file" id="one" aria-label="Photo"></label>
+<label>Docs <input type="file" id="many" multiple aria-label="Docs"></label>
+<button onclick="document.getElementById('hid').click()">Choose file</button>
+<input type="file" id="hid" hidden>
+<button>Not a picker</button>
+<div id="out" role="status">none</div>
+<script>
+  ["one", "many", "hid"].forEach(function (id) {
+    document.getElementById(id).addEventListener("change", function (e) {
+      document.getElementById("out").textContent = id + ":" + Array.from(e.target.files).map(function (f) { return f.name + "=" + f.size; }).join(",");
+    });
+  });
+</script>`,
+  ),
+  // Waits: a spinner and "Cargando" that go away 700 ms after the click; "Listo" exists in the footer from the start and in the panel later.
+  "/waits": page(
+    "Waits",
+    `<h1>Waits</h1>
+<button onclick="start()">Load data</button>
+<div role="progressbar" aria-label="Spinner" id="sp">Cargando datos</div>
+<section aria-label="Panel" id="panel"><h2>Results</h2><div id="res"></div></section>
+<footer>Listo (footer)</footer>
+<script>
+  function start() {
+    setTimeout(function () {
+      document.getElementById("sp").style.display = "none";
+      document.getElementById("res").textContent = "Listo (panel)";
+    }, 700);
+  }
+</script>`,
+  ),
+  // Requests: a fast GET, a POST, and a GET that starts 500 ms after the click.
+  "/reqs": page(
+    "Reqs",
+    `<h1>Reqs</h1>
+<button onclick="fetch('/api/data?x=1')">Ping</button>
+<button onclick="fetch('/api/form', { method: 'POST', headers: { 'content-type': 'text/plain' }, body: 'a=1' })">Post it</button>
+<button onclick="setTimeout(function () { fetch('/api/data?late=1'); }, 500)">Ping later</button>`,
+  ),
+  // Click kinds: the page logs what it observed.
+  "/clicks": page(
+    "Clicks",
+    `<h1>Clicks</h1>
+<button id="t">Target</button> <a href="/about" id="lnk" onclick="event.preventDefault(); log('link clicked')">Plain link</a>
+<pre id="log" role="log"></pre>
+<script>
+  var t = document.getElementById("t");
+  function log(s) { document.getElementById("log").textContent += s + ";"; }
+  t.addEventListener("click", function (e) { log("click" + e.detail + (e.shiftKey ? "+shift" : "") + (e.ctrlKey ? "+ctrl" : "")); });
+  t.addEventListener("dblclick", function () { log("dblclick"); });
+  t.addEventListener("contextmenu", function (e) { e.preventDefault(); log("contextmenu"); });
+  t.addEventListener("auxclick", function (e) { if (e.button === 1) log("middle"); });
+</script>`,
+  ),
+  // Viewport / media emulation readout: width, touch, pixel ratio and the media features the page sees.
+  "/media": page(
+    "Media",
+    `<h1>Media</h1><p id="env" role="status"></p><a href="/about">About us</a>
+<script>
+  var queries = ["(prefers-color-scheme: dark)", "print", "(prefers-reduced-motion: reduce)"].map(function (q) { return matchMedia(q); });
+  function upd() {
+    document.getElementById("env").textContent = "w:" + innerWidth + " dark:" + queries[0].matches + " print:" + queries[1].matches + " reduce:" + queries[2].matches + " touch:" + (navigator.maxTouchPoints > 0) + " dpr:" + devicePixelRatio;
+  }
+  queries.forEach(function (q) { q.addEventListener("change", upd); });
+  addEventListener("resize", upd);
+  upd();
+</script>`,
+    '<meta name="viewport" content="width=device-width, initial-scale=1">',
+  ),
+  // Drag and drop: HTML5 (dragstart/drop) and pointer based (pointerdown on the handle, pointerup over the slot).
+  "/drag": page(
+    "Drag",
+    `<h1>Drag</h1>
+<button id="card" draggable="true">Card A</button> <button id="zone">Drop zone</button>
+<button id="handle">Handle</button> <button id="slot">Slot</button>
+<pre id="log" role="log"></pre>
+<script>
+  function log(s) { document.getElementById("log").textContent += s + ";"; }
+  var card = document.getElementById("card"), zone = document.getElementById("zone");
+  card.addEventListener("dragstart", function (e) { e.dataTransfer.setData("text/plain", "Card A"); log("dragstart"); });
+  zone.addEventListener("dragover", function (e) { e.preventDefault(); });
+  zone.addEventListener("drop", function (e) {
+    e.preventDefault();
+    log("drop:" + e.dataTransfer.getData("text/plain") + ">zone");
+    fetch("/api/data?moved=1");
+    setTimeout(function () { log(confirm("Move card?") ? "moved" : "kept"); }, 0);
+  });
+  var down = null;
+  document.getElementById("handle").addEventListener("pointerdown", function () { down = "handle"; });
+  document.addEventListener("pointerup", function (e) {
+    var el = document.elementFromPoint(e.clientX, e.clientY);
+    if (down && el && el.id) log("pointer:" + down + ">" + el.id);
+    down = null;
+  });
+</script>`,
+  ),
+  // Find: 40 links (30 results cap), a few unique lines, and a long run of "a" for catastrophic-regex checks.
+  "/find": page(
+    "Find",
+    `<h1>Catalog</h1><a href="/about?utm=1">About us</a> <button>Checkout now</button>
+<ul>${Array.from({ length: 40 }, (_, i) => `<li><a href="/about?i=${i + 1}">Item ${i + 1}</a></li>`).join("")}</ul>
+<p>${"a".repeat(45)}!</p>`,
+  ),
+  // Element read: text, URL attributes with queries, a live input value, a password field, long text and a token-like string.
+  "/reads": page(
+    "Reads",
+    `<h1>Reads</h1>
+<p id="para">Hello <b>brave</b> world</p>
+<a id="lnk" href="/about?token=QUERYSECRET1&x=1#frag">Docs link</a>
+<a href="/about" data-redirect-url="https://example.test/cb?code=XYZSECRET2#h">Redirect link</a>
+<img alt="Logo" src="/logo.png?sig=SIGSECRET3" width="10" height="10">
+<input type="text" value="initial" aria-label="Name field">
+<input type="password" value="hunter2hunter2" aria-label="Pass field" placeholder="your secret" autocomplete="current-password">
+<p id="key">Key: ghp_${"abcdefghijklmnopqrstuvwxyz0123456789ab"} end</p>
+<p id="long">${"word ".repeat(600)}</p>`,
+  ),
+  // beforeunload: the page asks before it is left (Chromium needs a user gesture first: click the link).
+  "/unload": page(
+    "Unload",
+    `<h1>Unload</h1><a id="leave" href="/about">Leave page</a>
+<script>addEventListener("beforeunload", function (e) { e.preventDefault(); e.returnValue = ""; });</script>`,
+  ),
+  // A confirm raised 300 ms after the click, by a timer.
+  "/late": page(
+    "Late",
+    `<h1>Late</h1><button onclick="setTimeout(function () { out.textContent = confirm('Later?') ? 'late-yes' : 'late-no'; }, 300)">Late confirm</button>
+<div id="out" role="status">idle</div>
+<script>var out = document.getElementById("out");</script>`,
+  ),
+  // Fields that hold secrets in every way the page can say so.
+  "/sensitive": page(
+    "Sensitive",
+    `<h1>Sensitive</h1>
+<input type="text" autocomplete="cc-number" value="4111111111111111" aria-label="Pay number">
+<input type="text" name="cvv" value="123" aria-label="Security code">
+<input type="text" autocomplete="one-time-code" value="482913" aria-label="Code box">
+<input type="text" name="pwd" value="hunter2shown" aria-label="Shown secret">
+<label for="lab">Card number</label><input type="text" id="lab" value="4242424242424242">
+<input type="text" value="plain-value" aria-label="Plain field">`,
+  ),
+  // A request with a long path (for catastrophic-regex checks) and a plain /api/data one.
+  "/redos": page(
+    "Redos",
+    `<h1>Redos</h1><p id="done"></p>
+<script>
+  Promise.all([fetch("/${"a".repeat(30)}"), fetch("/api/data")]).then(function () { document.getElementById("done").textContent = "redos done"; });
+</script>`,
+  ),
   // 520 requests, more than the daemon keeps, so the oldest indexes get evicted.
   "/many": page(
     "Many",

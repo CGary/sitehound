@@ -123,6 +123,29 @@ export const diagRequest = defineCommand({
   },
 });
 
+export const diagDialogs = defineCommand({
+  name: "diag.dialogs",
+  description:
+    "Read the JavaScript dialogs (alert, confirm, prompt, beforeunload) the session handled, newest last, including ones that appeared outside any action. Messages are redacted; the answer given to a prompt is never recorded. The last 100 are kept.",
+  kind: "read",
+  flags: { ...SESSION_FLAG, limit: LIMIT_FLAG },
+  examples: [
+    "hound diag dialogs --session-name demo --json",
+    "hound diag dialogs --session-name demo --limit 100 --json",
+    "hound diag dialogs --session-name demo --plain",
+  ],
+  async run(input, ctx) {
+    const s: string = input["session-name"];
+    const r = await callSession(ctx, s, "dialogs", { limit: input.limit });
+    return {
+      summary: `${r.total} dialog(s) handled, ${r.entries.length} shown.`,
+      data: { total: r.total, truncated: r.truncated, entries: r.entries },
+      plain: r.entries.map((e) => `${e.time} ${e.type} ${e.action} ${e.message}`).join("\n") || "No dialogs handled.",
+      next_actions: [snapshotAction(s, "Read the current page.")],
+    };
+  },
+});
+
 export const diagTrace = defineCommand({
   name: "diag.trace",
   description: "Export the redacted action trace of a session opened with --trace on (steps.json plus a trace zip).",
@@ -148,4 +171,4 @@ export const diagTrace = defineCommand({
   },
 });
 
-export const diagCommands = [diagConsole, diagNetwork, diagRequest, diagTrace];
+export const diagCommands = [diagConsole, diagNetwork, diagRequest, diagDialogs, diagTrace];

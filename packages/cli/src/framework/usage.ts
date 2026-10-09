@@ -38,6 +38,11 @@ export const ruleApplies = (when: Record<string, WhenValue>, values: Record<stri
 export function usageLine(cmd: Command, given: Record<string, unknown> = {}, replace: Record<string, unknown> = {}): string {
   const parts = ["hound", ...cmd.name.split(".")];
   const done = new Set<string>();
+  // Flags the declared rules forbid for this combination are dropped, so the suggestion is itself valid.
+  const combo: Record<string, unknown> = {};
+  for (const [name, spec] of Object.entries(cmd.flags)) if (spec.default !== undefined) combo[name] = spec.default;
+  Object.assign(combo, given, replace);
+  const forbidden = new Set((cmd.requiresWhen ?? []).filter((r) => ruleApplies(r.when, combo)).flatMap((r) => r.forbid ?? []));
   const emit = (name: string, value: unknown) => {
     const spec = cmd.flags[name];
     if (!spec || value === undefined) return;
@@ -46,7 +51,7 @@ export function usageLine(cmd: Command, given: Record<string, unknown> = {}, rep
   };
   for (const [name, value] of Object.entries(given)) {
     const spec = cmd.flags[name];
-    if (!spec || name in replace) continue;
+    if (!spec || name in replace || forbidden.has(name)) continue;
     if (spec.sensitive || name === "value") {
       // Never echo what the caller typed: leave a quoted placeholder to substitute.
       parts.push(`--${name}`, shellQuote(placeholder(name, spec)));
@@ -65,9 +70,13 @@ export function usageLine(cmd: Command, given: Record<string, unknown> = {}, rep
     const name = group[0]!;
     parts.push(...(cmd.flags[name]!.type === "boolean" ? [`--${name}`] : [`--${name}`, ph(name)]));
   }
-  const effective: Record<string, unknown> = {};
-  for (const [name, spec] of Object.entries(cmd.flags)) if (spec.default !== undefined) effective[name] = spec.default;
-  Object.assign(effective, given, replace);
+  for (const group of cmd.requiresAny ?? []) {
+    if (group.some((n) => done.has(n) || given[n] !== undefined)) continue;
+    const name = group[0]!;
+    parts.push(...(cmd.flags[name]!.type === "boolean" ? [`--${name}`] : [`--${name}`, ph(name)]));
+    done.add(name);
+  }
+  const effective = combo;
   for (const rule of cmd.requiresWhen ?? []) {
     if (!ruleApplies(rule.when, effective)) continue;
     for (const name of rule.require ?? []) {

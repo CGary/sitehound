@@ -1,11 +1,12 @@
 import { existsSync, statSync } from "node:fs";
 import { readFile } from "node:fs/promises";
+import type { ClickModifier } from "@sitehound/core";
 import { HoundError } from "@sitehound/core/errors";
-import { MAX_OP_TIMEOUT_MS, TYPE_MAX_CHARS, TYPING_BASE_MS, TYPING_EXTRA_MS_PER_KEY } from "@sitehound/core/limits";
+import { ATTR_NAME_PATTERN, MAX_OP_TIMEOUT_MS, READ_LIMIT_DEFAULT, READ_LIMIT_MAX, TYPE_MAX_CHARS, TYPING_BASE_MS, TYPING_EXTRA_MS_PER_KEY, UPLOAD_MAX_BYTES, UPLOAD_MAX_FILES } from "@sitehound/core/limits";
 import { defineCommand } from "../framework/types.ts";
 import { checkCostRules, checkMaxChars } from "../framework/rules.ts";
 import type { FlagSpec } from "../framework/types.ts";
-import { REF_RULE, SESSION_FLAG, callSession, scrubSecret, snapshotAction } from "./browser-shared.ts";
+import { DIALOG_FLAGS, DIALOG_RULES, REF_RULE, SESSION_FLAG, callSession, dialogData, dialogNote, dialogParams, scrubSecret, snapshotAction } from "./browser-shared.ts";
 import { OUTPUT_FLAGS, checkOutputPath } from "./output.ts";
 import { givenInput } from "./shared.ts";
 
@@ -14,23 +15,124 @@ const MAX_VALUE_BYTES = 1_000_000;
 
 const afterAct = (s: string) => [snapshotAction(s, "Read the page after the action.")];
 
+const MODIFIER_NAMES = "Alt|Control|ControlOrMeta|Meta|Shift";
+
 export const elementClick = defineCommand({
   name: "element.click",
-  description: "Click an element by ref. The read level only clicks real http(s) links and <summary> (GET links with side effects, e.g. /logout, are not detected); everything else needs --actions interact.",
+  description:
+    "Click an element by ref. The read level only clicks real http(s) links and <summary> with a plain single left click (GET links with side effects, e.g. /logout, are not detected); everything else, including --count/--button/--modifiers, needs --actions interact.",
   kind: "write",
-  flags: { ...SESSION_FLAG, ref: REF_FLAG },
+  flags: {
+    ...SESSION_FLAG,
+    ref: REF_FLAG,
+    count: { type: "integer", min: 1, max: 3, description: "Click count: 2 = double click, 3 = triple click (default 1; needs --actions interact when above 1)" },
+    button: { type: "enum", values: ["left", "right", "middle"], description: "Mouse button (default left; right and middle need --actions interact)" },
+    modifiers: {
+      type: "string",
+      pattern: `^(?:${MODIFIER_NAMES})(?:,(?:${MODIFIER_NAMES}))*$`,
+      patternHint: "a comma list of Alt, Control, ControlOrMeta, Meta, Shift, e.g. Control,Shift",
+      maxLength: 80,
+      description: "Keys held during the click, comma list of Alt, Control, ControlOrMeta, Meta, Shift (needs --actions interact)",
+    },
+    ...DIALOG_FLAGS,
+  },
+  requiresWhen: DIALOG_RULES,
   examples: [
     "hound element click --session-name demo --ref e12 --json",
-    "hound element click --session-name demo --ref e7 --timeout 20 --json",
-    "hound element click --session-name work --ref e31 --plain",
+    "hound element click --session-name demo --ref e7 --dialog accept --timeout 20 --json",
+    "hound element click --session-name work --ref e31 --count 2 --button right --modifiers Shift --json",
   ],
   async run(input, ctx) {
     const s: string = input["session-name"];
-    const r = await callSession(ctx, s, "click", { ref: input.ref });
+    const modifiers = typeof input.modifiers === "string" ? input.modifiers.split(",") : undefined;
+    const r = await callSession(ctx, s, "click", {
+      ref: input.ref,
+      ...(input.count !== undefined && { count: input.count }),
+      ...(input.button !== undefined && { button: input.button }),
+      ...(modifiers && { modifiers: modifiers as ClickModifier[] }),
+      ...dialogParams(input),
+    });
     return {
-      summary: `Clicked ${r.ref}; now at ${r.url}.`,
-      data: { ref: r.ref, url: r.url, title: r.title, tabs: r.tabs },
+      summary: `Clicked ${r.ref}; now at ${r.url}.${dialogNote(r)}`,
+      data: {
+        ref: r.ref,
+        url: r.url,
+        title: r.title,
+        tabs: r.tabs,
+        ...(r.count !== undefined && { count: r.count }),
+        ...(r.button !== undefined && { button: r.button }),
+        ...(r.modifiers && { modifiers: r.modifiers }),
+        ...dialogData(r),
+      },
       next_actions: afterAct(s),
+    };
+  },
+});
+
+export const elementDrag = defineCommand({
+  name: "element.drag",
+  description:
+    "Drag an element onto another by ref (pointer down on the source, move to the target, release; HTML5 drag-and-drop events included). Needs --actions interact. Libraries that need several intermediate pointer moves may not react: check the page afterwards.",
+  kind: "write",
+  flags: {
+    ...SESSION_FLAG,
+    ref: { ...REF_FLAG, description: "Source element ref (what is dragged), e.g. e12" },
+    "to-ref": { type: "string", required: true, ...REF_RULE, description: "Target element ref (where it is dropped), e.g. e30" },
+    ...DIALOG_FLAGS,
+  },
+  requiresWhen: DIALOG_RULES,
+  examples: [
+    "hound element drag --session-name demo --ref e12 --to-ref e30 --json",
+    "hound element drag --session-name demo --ref e4 --to-ref e9 --dialog accept --json",
+    "hound element drag --session-name work --ref e7 --to-ref e8 --timeout 20 --json",
+  ],
+  async run(input, ctx) {
+    const s: string = input["session-name"];
+    const r = await callSession(ctx, s, "drag", { ref: input.ref, toRef: input["to-ref"], ...dialogParams(input) });
+    return {
+      summary: `Dragged ${r.ref} onto ${r.toRef}; now at ${r.url}.${dialogNote(r)}`,
+      data: { ref: r.ref, toRef: r.toRef, url: r.url, title: r.title, tabs: r.tabs, ...dialogData(r) },
+      next_actions: afterAct(s),
+    };
+  },
+});
+
+export const elementRead = defineCommand({
+  name: "element.read",
+  description:
+    "Read one element: its text (innerText) or one attribute, without a full snapshot. Tokens are masked and URL attributes (href, src, action, formaction, data-*url*) lose their query and fragment. Password fields yield no text and only descriptive attributes (ACTION_BLOCKED otherwise). --attr value on a form field returns its current value.",
+  kind: "read",
+  flags: {
+    ...SESSION_FLAG,
+    ref: REF_FLAG,
+    attr: { type: "string", pattern: ATTR_NAME_PATTERN, patternHint: "an attribute name such as href, value or aria-label", maxLength: 64, description: "Attribute to read instead of the text, e.g. href, src, value, aria-label" },
+    "limit-chars": { type: "integer", default: READ_LIMIT_DEFAULT, min: 1, max: READ_LIMIT_MAX, description: "Max characters returned (data.chars is the full length; data.truncated tells if it was cut)" },
+  },
+  examples: [
+    "hound element read --session-name demo --ref e12 --json",
+    "hound element read --session-name demo --ref e12 --attr href --json",
+    "hound element read --session-name demo --ref e5 --attr value --limit-chars 500 --json",
+  ],
+  async run(input, ctx) {
+    const s: string = input["session-name"];
+    const r = await callSession(ctx, s, "read", { ref: input.ref, ...(input.attr && { attr: input.attr }), limitChars: input["limit-chars"] });
+    const shown = r.attr !== undefined ? r.value : r.text;
+    return {
+      summary:
+        r.attr !== undefined
+          ? r.value === null
+            ? `${r.ref} has no "${r.attr}" attribute.`
+            : `Read ${r.attr} of ${r.ref} (${r.chars} chars${r.truncated ? ", truncated" : ""}).`
+          : `Read the text of ${r.ref} (${r.chars} chars${r.truncated ? ", truncated" : ""}).`,
+      data: {
+        ref: r.ref,
+        ...(r.attr !== undefined && { attr: r.attr }),
+        ...(r.attr !== undefined ? { value: r.value } : { text: r.text }),
+        chars: r.chars,
+        truncated: r.truncated,
+      },
+      plain: shown ?? "",
+      next_actions: [snapshotAction(s, "Read the page.")],
     };
   },
 });
@@ -48,7 +150,7 @@ export const elementHover = defineCommand({
   async run(input, ctx) {
     const s: string = input["session-name"];
     const r = await callSession(ctx, s, "hover", { ref: input.ref });
-    return { summary: `Hovered ${r.ref}.`, data: { ref: r.ref }, next_actions: afterAct(s) };
+    return { summary: `Hovered ${r.ref}.${dialogNote(r)}`, data: { ref: r.ref, ...dialogData(r) }, next_actions: afterAct(s) };
   },
 });
 
@@ -109,8 +211,8 @@ export const elementFill = defineCommand({
     try {
       const r = await callSession(ctx, s, "fill", { ref: input.ref, value });
       return {
-        summary: `Filled ${r.ref} (${r.chars} chars).`,
-        data: { ref: r.ref, chars: r.chars },
+        summary: `Filled ${r.ref} (${r.chars} chars).${dialogNote(r)}`,
+        data: { ref: r.ref, chars: r.chars, ...dialogData(r) },
         next_actions: afterAct(s),
       };
     } catch (err) {
@@ -131,8 +233,10 @@ export const elementType = defineCommand({
     "value-file": { type: "path", sensitive: true, maxChars: TYPE_MAX_CHARS, description: `File with the text to type, or - for stdin (one trailing newline is removed; at most ${TYPE_MAX_CHARS} characters)` },
     "delay-ms": { type: "integer", default: 30, min: 0, max: 1000, description: "Pause between key presses in milliseconds; the typing time must fit in one operation (see cost_rules in --schema)" },
     clear: { type: "boolean", description: "Empty the field first (fill with empty text, or select-all + Backspace for elements that are not inputs)" },
+    ...DIALOG_FLAGS,
   },
   requires: [["value", "value-file"]],
+  requiresWhen: DIALOG_RULES,
   costRules: [{ text: ["value", "value-file"], perChar: "delay-ms", extraMs: TYPING_EXTRA_MS_PER_KEY, baseMs: TYPING_BASE_MS, maxMs: MAX_OP_TIMEOUT_MS }],
   examples: [
     'hound element type --session-name demo --ref e5 --value "mar" --json',
@@ -151,10 +255,11 @@ export const elementType = defineCommand({
         value,
         delayMs: delay,
         ...(input.clear && { clear: true }),
+        ...dialogParams(input),
       });
       return {
-        summary: `Typed ${r.chars} chars into ${r.ref}.`,
-        data: { ref: r.ref, chars: r.chars },
+        summary: `Typed ${r.chars} chars into ${r.ref}.${dialogNote(r)}`,
+        data: { ref: r.ref, chars: r.chars, ...dialogData(r) },
         next_actions: [snapshotAction(s, "Read the page: suggestions or options may have appeared (refs change).")],
       };
     } catch (err) {
@@ -173,7 +278,9 @@ export const elementDownload = defineCommand({
     ref: REF_FLAG,
     ...OUTPUT_FLAGS,
     output: { ...OUTPUT_FLAGS.output!, description: "Save the file here instead of the session's downloads directory (relative paths resolve against the current directory; refuses directories and symlinks)" },
+    ...DIALOG_FLAGS,
   },
+  requiresWhen: DIALOG_RULES,
   examples: [
     "hound element download --session-name demo --ref e12 --json",
     "hound element download --session-name demo --ref e12 --output ./report.pdf --json",
@@ -182,12 +289,40 @@ export const elementDownload = defineCommand({
   async run(input, ctx) {
     const s: string = input["session-name"];
     if (input.output) await checkOutputPath(this, givenInput(input, ctx), input.output, input["if-exists"]);
-    const r = await callSession(ctx, s, "download", { ref: input.ref, ...(input.output && { output: input.output, ifExists: input["if-exists"] }) });
+    const r = await callSession(ctx, s, "download", { ref: input.ref, ...(input.output && { output: input.output, ifExists: input["if-exists"] }), ...dialogParams(input) });
     return {
-      summary: `Downloaded ${r.suggestedFilename} (${r.bytes} bytes).`,
-      data: { file: r.file, bytes: r.bytes, suggestedFilename: r.suggestedFilename, url: r.url },
+      summary: `Downloaded ${r.suggestedFilename} (${r.bytes} bytes).${dialogNote(r)}`,
+      data: { file: r.file, bytes: r.bytes, suggestedFilename: r.suggestedFilename, url: r.url, ...dialogData(r) },
       plain: r.file,
       next_actions: [snapshotAction(s, "Read the page after the click.")],
+    };
+  },
+});
+
+export const elementUpload = defineCommand({
+  name: "element.upload",
+  description: `Attach local files to a file field by ref: an <input type=file> directly, or a button/label that opens the file chooser (it is clicked). Needs --actions interact. Upload only files the user named: sitehound's own data (.hound), .env files, HAR/trace files, SSH/cloud credentials and key files are refused (ACTION_BLOCKED). At most ${UPLOAD_MAX_FILES} regular files, ${UPLOAD_MAX_BYTES / (1024 * 1024)} MiB in total. Returns file names and sizes only.`,
+  kind: "write",
+  flags: {
+    ...SESSION_FLAG,
+    ref: REF_FLAG,
+    file: { type: "path", required: true, repeatable: true, maxLength: 4096, description: `File to upload (relative paths resolve against the current directory); repeat for several files, at most ${UPLOAD_MAX_FILES}` },
+    ...DIALOG_FLAGS,
+  },
+  requiresWhen: DIALOG_RULES,
+  examples: [
+    "hound element upload --session-name demo --ref e9 --file ./invoice.pdf --json",
+    "hound element upload --session-name demo --ref e9 --file ./a.png --file ./b.png --json",
+    "hound element upload --session-name demo --ref e14 --file ./data.csv --timeout 20 --json",
+  ],
+  async run(input, ctx) {
+    const s: string = input["session-name"];
+    const r = await callSession(ctx, s, "upload", { ref: input.ref, files: input.file, ...dialogParams(input) });
+    return {
+      summary: `Attached ${r.files.length} file(s) to ${r.ref}.${dialogNote(r)}`,
+      data: { ref: r.ref, files: r.files, ...dialogData(r) },
+      plain: r.files.map((f) => `${f.name} ${f.bytes}`).join("\n"),
+      next_actions: afterAct(s),
     };
   },
 });
@@ -200,7 +335,9 @@ export const elementSelect = defineCommand({
     ...SESSION_FLAG,
     ref: REF_FLAG,
     option: { type: "string", required: true, repeatable: true, maxLength: 1000, description: "Option value or label; required at least once, repeat for multi-selects" },
+    ...DIALOG_FLAGS,
   },
+  requiresWhen: DIALOG_RULES,
   examples: [
     "hound element select --session-name demo --ref e8 --option small --json",
     'hound element select --session-name demo --ref e8 --option "Extra large" --json',
@@ -208,10 +345,10 @@ export const elementSelect = defineCommand({
   ],
   async run(input, ctx) {
     const s: string = input["session-name"];
-    const r = await callSession(ctx, s, "select", { ref: input.ref, options: input.option });
+    const r = await callSession(ctx, s, "select", { ref: input.ref, options: input.option, ...dialogParams(input) });
     return {
-      summary: `Selected ${r.selected.length} option(s) in ${r.ref}.`,
-      data: { ref: r.ref, selected: r.selected },
+      summary: `Selected ${r.selected.length} option(s) in ${r.ref}.${dialogNote(r)}`,
+      data: { ref: r.ref, selected: r.selected, ...dialogData(r) },
       next_actions: afterAct(s),
     };
   },
@@ -225,7 +362,9 @@ export const elementPress = defineCommand({
     ...SESSION_FLAG,
     key: { type: "string", required: true, maxLength: 100, description: "Playwright key name, e.g. Enter, Escape, ArrowDown, Control+A" },
     ref: { type: "string", ...REF_RULE, description: "Element ref to focus first, e.g. e12 (default: the focused element)" },
+    ...DIALOG_FLAGS,
   },
+  requiresWhen: DIALOG_RULES,
   examples: [
     "hound element press --session-name demo --key Enter --json",
     "hound element press --session-name demo --key Escape --ref e4 --json",
@@ -233,13 +372,13 @@ export const elementPress = defineCommand({
   ],
   async run(input, ctx) {
     const s: string = input["session-name"];
-    const r = await callSession(ctx, s, "press", { key: input.key, ...(input.ref && { ref: input.ref }) });
+    const r = await callSession(ctx, s, "press", { key: input.key, ...(input.ref && { ref: input.ref }), ...dialogParams(input) });
     return {
-      summary: `Pressed ${r.key}; now at ${r.url}.`,
-      data: { key: r.key, url: r.url, title: r.title },
+      summary: `Pressed ${r.key}; now at ${r.url}.${dialogNote(r)}`,
+      data: { key: r.key, url: r.url, title: r.title, ...dialogData(r) },
       next_actions: afterAct(s),
     };
   },
 });
 
-export const elementCommands = [elementClick, elementHover, elementFill, elementType, elementSelect, elementPress, elementDownload];
+export const elementCommands = [elementClick, elementDrag, elementRead, elementHover, elementFill, elementType, elementSelect, elementPress, elementDownload, elementUpload];

@@ -11,7 +11,7 @@ import { constants as fsConstants } from "node:fs";
 import { chmod, copyFile, link, rename, rm, stat, writeFile } from "node:fs/promises";
 import { createServer, type Socket } from "node:net";
 import { dirname, join } from "node:path";
-import type { BrowserContext, Download, Locator, Page, Request } from "playwright";
+import type { BrowserContext, Dialog, Download, FileChooser, Locator, Page, Request } from "playwright";
 import { isMissingBrowser, missingBrowserError, openSession, type Session } from "../browser.ts";
 import { HoundError, isHoundError } from "../errors.ts";
 import { ensurePrivateDir } from "../paths.ts";
@@ -23,6 +23,7 @@ import {
   STARTUP_ERROR_FILE,
   STATE_FILE,
   assertIdleTimeout,
+  assertViewport,
   chooseSocketPath,
   isStateChanging,
   readJson,
@@ -30,20 +31,53 @@ import {
   sessionRunsDir,
   writePrivateJson,
 } from "./state.ts";
-import type {
-  BrowserOp,
-  BrowserOpResult,
-  BrowserSessionInfo,
-  ConsoleEntry,
-  DaemonConfig,
-  DaemonState,
-  NetworkEntry,
-  TabInfo,
-  WaitUntil,
-  WireRequest,
-  WireResponse,
+import {
+  CLICK_MODIFIERS,
+  REQUEST_METHODS,
+  WAIT_FOR,
+  type BrowserOp,
+  type BrowserOpResult,
+  type BrowserSessionInfo,
+  type ClickModifier,
+  type ColorScheme,
+  type ConsoleEntry,
+  type DaemonConfig,
+  type DaemonState,
+  type DialogAction,
+  type DialogEntry,
+  type MediaType,
+  type NetworkEntry,
+  type ReducedMotion,
+  type TabInfo,
+  type WaitUntil,
+  type WireRequest,
+  type WireResponse,
 } from "./types.ts";
-import { MAX_OP_TIMEOUT_MS, REQUEST_BUFFER_CAP, TYPE_MAX_CHARS, typingFits, typingTimeoutMs } from "./limits.ts";
+import {
+  ATTR_NAME_PATTERN,
+  DIALOG_BUFFER_CAP,
+  DIALOG_GRACE_MS,
+  DIALOG_TEXT_MAX_CHARS,
+  FIND_CONTEXT_MAX,
+  FIND_LIMIT_DEFAULT,
+  FIND_LIMIT_MAX,
+  FIND_PATTERN_MAX_CHARS,
+  FIND_REGEX_BUDGET_MS,
+  FIND_SNAPSHOT_MAX_CHARS,
+  MAX_OP_TIMEOUT_MS,
+  READ_LIMIT_DEFAULT,
+  READ_LIMIT_MAX,
+  READ_SCAN_MAX_CHARS,
+  REQUEST_BUFFER_CAP,
+  TYPE_MAX_CHARS,
+  UPLOAD_MAX_FILES,
+  typingFits,
+  typingTimeoutMs,
+} from "./limits.ts";
+import { matchRegex, matchSubstring, matchText, parseRegexArg, parseRequestValue } from "./find.ts";
+import { PASSWORD_SAFE_ATTRS, SENSITIVE_HINT, passwordBlocked, redactAttr, sanitizeSnapshot, type ReadFacts } from "./read.ts";
+import { scrubTokens } from "../redact.ts";
+import { resolveUploadFiles } from "./upload.ts";
 
 const ACTION_TIMEOUT_MS = 10_000;
 const NAV_TIMEOUT_MS = 30_000;
@@ -60,6 +94,9 @@ const TRACE_OPTIONS = { screenshots: false, snapshots: true, sources: false } as
 
 type Params = Record<string, unknown>;
 
+const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
+/** Ops that accept a per-op dialog policy (`dialog`, `dialogText`): they can trigger alert/confirm/prompt/beforeunload. */
+const DIALOG_OPS: ReadonlySet<BrowserOp> = new Set<BrowserOp>(["click", "press", "select", "type", "download", "upload", "drag", "navigate", "back", "forward", "reload"]);
 const log = (msg: string) => process.stderr.write(`${new Date().toISOString()} ${msg}\n`);
 const now = () => new Date().toISOString();
 let fileSeq = 0;
@@ -127,7 +164,8 @@ const OP_DEFAULT_TIMEOUT: Partial<Record<BrowserOp, number>> = {
   navigate: NAV_TIMEOUT_MS, snapshot: NAV_TIMEOUT_MS, screenshot: NAV_TIMEOUT_MS, wait: WAIT_TIMEOUT_MS,
   back: NAV_TIMEOUT_MS, forward: NAV_TIMEOUT_MS, reload: NAV_TIMEOUT_MS, tabs: NAV_TIMEOUT_MS,
   click: ACTION_TIMEOUT_MS, hover: ACTION_TIMEOUT_MS, fill: ACTION_TIMEOUT_MS, select: ACTION_TIMEOUT_MS, press: ACTION_TIMEOUT_MS,
-  type: ACTION_TIMEOUT_MS, download: DOWNLOAD_TIMEOUT_MS, request: NAV_TIMEOUT_MS,
+  type: ACTION_TIMEOUT_MS, upload: ACTION_TIMEOUT_MS, download: DOWNLOAD_TIMEOUT_MS, request: NAV_TIMEOUT_MS,
+  drag: ACTION_TIMEOUT_MS, find: NAV_TIMEOUT_MS, read: ACTION_TIMEOUT_MS,
 };
 
 /**
@@ -146,7 +184,7 @@ function timeoutError(op: BrowserOp, p: Params, snapshotCmd?: string): HoundErro
     const url = stripUrl(p.url);
     what = `"${url}" to load`;
     [field, received] = ["url", url];
-  } else if (ref && ["click", "hover", "fill", "select", "press", "type", "download"].includes(op)) {
+  } else if (ref && ["click", "hover", "fill", "select", "press", "type", "upload", "download", "drag", "read"].includes(op)) {
     what = `element "${ref}" to be actionable for ${op}`;
     [field, received] = ["ref", ref];
   } else if (op === "press" && str("key")) {
@@ -262,7 +300,14 @@ export async function runDaemon(dir: string): Promise<void> {
 
   let session: Session;
   try {
-    session = await openSession({ profile: config.profile, headless: config.display === "headless", downloadsPath: join(dir, "pw-downloads") });
+    session = await openSession({
+      profile: config.profile,
+      headless: config.display === "headless",
+      downloadsPath: join(dir, "pw-downloads"),
+      ...(config.viewport ? { viewport: config.viewport } : {}),
+      ...(config.deviceScaleFactor ? { deviceScaleFactor: config.deviceScaleFactor } : {}),
+      ...(config.mobile ? { mobile: true } : {}),
+    });
   } catch (err) {
     const msg = firstLine(err);
     const herr = isHoundError(err)
@@ -288,12 +333,42 @@ export async function runDaemon(dir: string): Promise<void> {
   /** Playwright Request objects by `network` index, oldest first; at most REQUEST_BUFFER_CAP are kept (older ones are evicted). */
   const requestBuffer = new Map<number, Request>();
   let requestSeq = 0;
+  /** `requestSeq` when the last state-changing op started: the default mark of `wait --for request`. */
+  let requestMark = 0;
   const remember = (req: Request): number => {
     const index = ++requestSeq;
     requestBuffer.set(index, req);
     if (requestBuffer.size > REQUEST_BUFFER_CAP) requestBuffer.delete(requestBuffer.keys().next().value as number);
     return index;
   };
+  // ---- JavaScript dialogs: one context-level handler covers every tab (popups included), so none can ever hang a page ----
+  const dialogDefault: DialogAction = config.dialog === "accept" && config.actions === "interact" ? "accept" : "dismiss";
+  const dialogRing: DialogEntry[] = [];
+  type DialogPolicy = { action: DialogAction; text?: string };
+  /** Set only while an op runs (ops are serial): the op's explicit dialog override (if any), and the dialogs it handled. */
+  let opPolicy: DialogPolicy | undefined;
+  let opDialogs: DialogEntry[] | undefined;
+  /** The running op navigates away (navigate/back/forward/reload/tab close): a beforeunload dialog is then always accepted. */
+  let opLeaves = false;
+  /** The last op's explicit override stays in force for a short while after it returns, for dialogs raised by timers or requests it started. */
+  let graceOp: { op: string; policy: DialogPolicy; until: number } | undefined;
+  context.on("dialog", (d: Dialog) => {
+    const leaving = d.type() === "beforeunload" && opLeaves;
+    const late = !opPolicy && !leaving && graceOp && Date.now() < graceOp.until ? graceOp : undefined;
+    const policy: DialogPolicy = leaving ? { action: "accept" } : (opPolicy ?? late?.policy ?? { action: dialogDefault });
+    const entry: DialogEntry = {
+      time: now(),
+      type: d.type() as DialogEntry["type"],
+      message: redactText(d.message(), 300),
+      action: policy.action,
+      ...(late ? { op: late.op } : {}),
+    };
+    push(dialogRing, entry, DIALOG_BUFFER_CAP);
+    if (opDialogs && opDialogs.length < DIALOG_BUFFER_CAP) opDialogs.push(entry);
+    // Without an answer text a prompt is accepted with its own default value (Playwright would send an empty string).
+    const handled = policy.action === "accept" ? d.accept(d.type() === "prompt" ? (policy.text ?? d.defaultValue()) : undefined) : d.dismiss();
+    handled.catch(() => {});
+  });
   context.on("console", (m) => {
     const type = m.type();
     if (type !== "error" && type !== "warning") return;
@@ -319,6 +394,14 @@ export async function runDaemon(dir: string): Promise<void> {
     if (r.status() >= 400) push(failedRing, entry, NETWORK_FAILED_CAP);
     push(allRing, entry, NETWORK_ALL_CAP);
   });
+
+  // ---- media emulation (page emulate): kept for the session and applied to every tab opened later ----
+  type Emulation = { colorScheme?: ColorScheme; media?: MediaType; reducedMotion?: ReducedMotion };
+  let emulation: Emulation = {};
+  const applyEmulation = async (pg: Page): Promise<void> => {
+    if (Object.keys(emulation).length > 0) await pg.emulateMedia(emulation).catch(() => {});
+  };
+  context.on("page", (pg) => void applyEmulation(pg));
 
   let active: Page = await context.newPage();
   async function page(): Promise<Page> {
@@ -358,16 +441,21 @@ export async function runDaemon(dir: string): Promise<void> {
   const state: DaemonState = { ...config, pid: process.pid, startedAt, socket: socketPath };
   const info = async (): Promise<BrowserSessionInfo> => {
     const p = active.isClosed() ? undefined : active;
+    const viewport = p?.viewportSize() ?? config.viewport;
     return {
       name,
       pid: process.pid,
       ...(config.profile ? { profile: config.profile } : {}),
       actions: config.actions,
       display: config.display,
+      dialog: dialogDefault,
       trace: config.trace,
       startedAt,
       idleTimeoutMinutes: config.idleTimeoutMinutes,
       alive: browser.isConnected(),
+      ...(viewport ? { viewport } : {}),
+      ...(config.deviceScaleFactor ? { deviceScaleFactor: config.deviceScaleFactor } : {}),
+      ...(config.mobile ? { mobile: true } : {}),
       ...(p ? { currentUrl: cleanUrl(p.url()) } : {}),
       tabs: context.pages().length,
     };
@@ -380,15 +468,19 @@ export async function runDaemon(dir: string): Promise<void> {
   /** Lets a pending (error-page) navigation finish so the next goto is not interrupted by it. */
   const settle = (pg: Page) => pg.waitForLoadState("load", { timeout: capWait(3000) }).catch(() => {});
 
-  async function locate(p: Page, ref: string): Promise<Locator> {
+  function refLocator(p: Page, ref: string, field = "ref"): Locator {
     if (!/^[a-z0-9]{1,32}$/i.test(ref)) {
-      throw new HoundError("INVALID_ARGUMENT", `--ref must be ${REF_HINT}.`, { field: "ref", received: redactText(ref, 40) });
+      throw new HoundError("INVALID_ARGUMENT", `--${field} must be ${REF_HINT}.`, { field, received: redactText(ref, 40) });
     }
-    const loc = p.locator(`aria-ref=${ref}`);
+    return p.locator(`aria-ref=${ref}`);
+  }
+
+  async function locate(p: Page, ref: string, field = "ref"): Promise<Locator> {
+    const loc = refLocator(p, ref, field);
     const count = await loc.count().catch(() => 0);
     if (count === 0) {
       throw new HoundError("REF_NOT_FOUND", `Element ref "${ref}" is not on the current page (stale or unknown); use ${REF_HINT}.`, {
-        field: "ref",
+        field,
         received: ref,
         retryable: true,
         suggestedFix: `hound page snapshot --session-name ${name} --json`,
@@ -476,6 +568,21 @@ export async function runDaemon(dir: string): Promise<void> {
     return { promise, cancel: () => done(null) };
   }
 
+  /** Resolves with the next file chooser opened by `pg`, or null after `ms`. */
+  function nextFileChooser(pg: Page, ms: number): { promise: Promise<FileChooser | null>; cancel(): void } {
+    let finish!: (c: FileChooser | null) => void;
+    const promise = new Promise<FileChooser | null>((res) => (finish = res));
+    const onChooser = (c: FileChooser) => done(c);
+    const timer = setTimeout(() => done(null), ms);
+    function done(c: FileChooser | null): void {
+      clearTimeout(timer);
+      pg.off("filechooser", onChooser);
+      finish(c);
+    }
+    pg.on("filechooser", onChooser);
+    return { promise, cancel: () => done(null) };
+  }
+
   const exists = (output: string) =>
     new HoundError("CONFLICT", `--output already exists: ${output}. Pass --if-exists overwrite to replace it, or choose another path.`, { field: "output", received: output, retryable: false });
 
@@ -543,6 +650,30 @@ export async function runDaemon(dir: string): Promise<void> {
     return dest;
   }
 
+  function clickModifiers(p: Params): ClickModifier[] {
+    const v = p.modifiers;
+    if (v === undefined || v === null) return [];
+    if (!Array.isArray(v) || v.length > CLICK_MODIFIERS.length * 2) throw new HoundError("INVALID_ARGUMENT", "--modifiers must be a list of key names.", { field: "modifiers" });
+    for (const m of v) {
+      if (typeof m !== "string" || !CLICK_MODIFIERS.includes(m as ClickModifier)) {
+        throw new HoundError("INVALID_ENUM", `Invalid --modifiers entry "${redactText(String(m), 40)}".`, { field: "modifiers", received: redactText(String(m), 40), allowed: CLICK_MODIFIERS });
+      }
+    }
+    return [...new Set(v as ClickModifier[])];
+  }
+
+  /** The dialog policy of one op: the per-op override (needs interact to accept) or the session default. The answer text is never echoed. */
+  function dialogPolicy(op: BrowserOp, p: Params): DialogPolicy & { explicit: boolean } {
+    if (!DIALOG_OPS.has(op)) return { action: dialogDefault, explicit: false };
+    const dialog = optEnum(p, "dialog", "dialog", ["accept", "dismiss"] as const);
+    const text = optStr(p, "dialogText", "dialog-text");
+    if (text !== undefined && text.length > DIALOG_TEXT_MAX_CHARS) {
+      throw new HoundError("INVALID_ARGUMENT", `--dialog-text must be at most ${DIALOG_TEXT_MAX_CHARS} characters.`, { field: "dialog-text", received: `${text.length} chars` });
+    }
+    if (dialog === "accept" && config.actions === "read") throw blocked("Accepting a dialog", "--dialog accept needs interact");
+    return { action: dialog ?? dialogDefault, ...(text !== undefined ? { text } : {}), explicit: dialog !== undefined || text !== undefined };
+  }
+
   const ops: { [K in BrowserOp]: (p: Params) => Promise<BrowserOpResult<K>> } = {
     ping: async () => ({ pong: true, pid: process.pid, name }),
     status: info,
@@ -577,7 +708,7 @@ export async function runDaemon(dir: string): Promise<void> {
       const limit = optInt(p, "limitChars", "limit-chars", 1, 200_000) ?? 8000;
       const output = await outputPath(p);
       const pg = await page();
-      const full = await pg.ariaSnapshot({ mode: "ai", ...(depth !== undefined ? { depth } : {}), timeout: timeoutOf(p, NAV_TIMEOUT_MS) });
+      const full = sanitizeSnapshot(await pg.ariaSnapshot({ mode: "ai", ...(depth !== undefined ? { depth } : {}), timeout: timeoutOf(p, NAV_TIMEOUT_MS) }));
       const truncated = full.length > limit;
       let text = full;
       if (truncated) {
@@ -613,20 +744,77 @@ export async function runDaemon(dir: string): Promise<void> {
     },
 
     async wait(p) {
-      const kind = reqEnum(p, "for", "for", ["text", "url", "ref", "load"] as const);
+      const kind = reqEnum(p, "for", "for", WAIT_FOR);
       const timeout = timeoutOf(p, WAIT_TIMEOUT_MS);
       const asked = optInt(p, "timeoutMs", "timeout", 1, 600_000) ?? WAIT_TIMEOUT_MS;
+      const within = optStr(p, "within", "within");
+      const method = optEnum(p, "method", "method", REQUEST_METHODS);
+      const sinceIndex = optInt(p, "sinceIndex", "since-index", 0, 2 ** 31 - 1);
+      if (within !== undefined && kind !== "text" && kind !== "text-gone") {
+        throw new HoundError("INVALID_ARGUMENT", "--within only applies to --for text and --for text-gone.", { field: "within", received: kind, allowed: ["text", "text-gone"] });
+      }
+      if ((method !== undefined || sinceIndex !== undefined) && kind !== "request") {
+        throw new HoundError("INVALID_ARGUMENT", "--method and --since-index only apply to --for request.", { field: method !== undefined ? "method" : "since-index", received: kind, allowed: ["request"] });
+      }
       const pg = await page();
       const t0 = Date.now();
+      const timedOut = (): HoundError => {
+        const value = optStr(p, "value", "value");
+        const what = kind === "load" ? `page load state "${value ?? "load"}"` : `${kind} "${redactText(value ?? "", 200)}"`;
+        return new HoundError("TIMEOUT", `Timed out after ${formatSeconds(asked)} waiting for ${what}.`, {
+          field: kind === "load" ? "for" : "value",
+          received: kind === "load" ? (value ?? "load") : redactText(value ?? "", 200),
+          retryable: true,
+        });
+      };
+      if (kind === "request") {
+        const pattern = parseRequestValue(reqStr(p, "value", "value"));
+        // Requests are numbered when they finish; only finished ones after the mark count (a fast one that ended before this wait began is not missed).
+        const since = sinceIndex ?? requestMark;
+        const until = Date.now() + timeout;
+        let checked = since;
+        for (;;) {
+          const top = allRing.length > 0 ? allRing[allRing.length - 1]!.index : checked;
+          const fresh = allRing.filter((e) => e.index > checked && (method === undefined || e.method === method));
+          if (fresh.length > 0) {
+            // A regex runs in a worker with a time budget, like `page find`: it must never freeze the daemon.
+            const budget = Math.min(FIND_REGEX_BUDGET_MS, until - Date.now());
+            let hits: number[] = [];
+            if ("substring" in pattern) hits = matchSubstring(fresh.map((e) => e.url), pattern.substring);
+            else if (budget >= 100) hits = await matchRegex(fresh.map((e) => e.url), pattern.source, pattern.flags, budget, { name: "value", fallback: "a plain substring" });
+            else throw timedOut();
+            const hit = hits.length > 0 ? fresh[hits[0]!] : undefined;
+            if (hit) {
+              const { index, method: m, status, failure, url } = hit;
+              return { ...(await location(pg)), waitedMs: Date.now() - t0, sinceIndex: since, request: { index, method: m, ...(status !== undefined && { status }), ...(failure && { failure }), url } };
+            }
+            checked = Math.max(checked, top);
+          } else checked = Math.max(checked, top);
+          if (Date.now() >= until) throw timedOut();
+          await sleep(Math.min(50, Math.max(1, until - Date.now())));
+        }
+      }
+      /** text-gone / ref-hidden: was the thing visible when the wait began? false = the condition held at once (check the value). */
+      let wasPresent: boolean | undefined;
       try {
         if (kind === "load") {
           const state = optEnum(p, "value", "value", WAIT_UNTIL) ?? "load";
           await pg.waitForLoadState(state, { timeout });
         } else {
           const value = reqStr(p, "value", "value");
-          if (kind === "text") await pg.getByText(value).first().waitFor({ state: "visible", timeout });
-          else if (kind === "ref") await (await locate(pg, value)).waitFor({ state: "visible", timeout });
-          else {
+          if (kind === "text" || kind === "text-gone") {
+            // For text-gone a --within element that has vanished means its text is gone too.
+            const scope = within ? (kind === "text" ? await locate(pg, within, "within") : refLocator(pg, within, "within").first()) : pg;
+            const found = scope.getByText(value).filter({ visible: true }).first();
+            if (kind === "text-gone") wasPresent = (await found.count().catch(() => 0)) > 0;
+            await found.waitFor({ state: kind === "text" ? "visible" : "detached", timeout });
+          } else if (kind === "ref") await (await locate(pg, value)).waitFor({ state: "visible", timeout });
+          else if (kind === "ref-hidden") {
+            // A ref that is no longer on the page (the spinner was removed) counts as hidden.
+            const target = refLocator(pg, value, "value").first();
+            wasPresent = await target.isVisible().catch(() => false);
+            await target.waitFor({ state: "hidden", timeout });
+          } else {
             // Agents only ever see stripped URLs, so a glob may match the full URL or origin + path.
             const re = value.includes("*") ? globToRegExp(value) : undefined;
             await pg.waitForURL((u) => (re ? re.test(u.href) || re.test(u.origin + u.pathname) : u.href.includes(value)), { timeout });
@@ -634,15 +822,9 @@ export async function runDaemon(dir: string): Promise<void> {
         }
       } catch (err) {
         if ((err as Error)?.name !== "TimeoutError") throw err;
-        const value = optStr(p, "value", "value");
-        const what = kind === "load" ? `page load state "${value ?? "load"}"` : `${kind} "${redactText(value ?? "", 200)}"`;
-        throw new HoundError("TIMEOUT", `Timed out after ${formatSeconds(asked)} waiting for ${what}.`, {
-          field: kind === "load" ? "for" : "value",
-          received: kind === "load" ? (value ?? "load") : redactText(value ?? "", 200),
-          retryable: true,
-        });
+        throw timedOut();
       }
-      return { ...(await location(pg)), waitedMs: Date.now() - t0 };
+      return { ...(await location(pg)), waitedMs: Date.now() - t0, ...(wasPresent !== undefined ? { wasPresent } : {}) };
     },
 
     async back(p) {
@@ -708,6 +890,7 @@ export async function runDaemon(dir: string): Promise<void> {
         if (url) checkNavUrl(url);
         const fresh = await context.newPage();
         active = fresh;
+        await applyEmulation(fresh);
         if (url) {
           try {
             await fresh.goto(url, { timeout: timeoutOf(p, NAV_TIMEOUT_MS) });
@@ -726,15 +909,28 @@ export async function runDaemon(dir: string): Promise<void> {
 
     async click(p) {
       const ref = reqStr(p, "ref", "ref");
+      const count = optInt(p, "count", "count", 1, 3) ?? 1;
+      const button = optEnum(p, "button", "button", ["left", "right", "middle"] as const) ?? "left";
+      const modifiers = clickModifiers(p);
+      if (config.actions === "read" && (count !== 1 || button !== "left" || modifiers.length > 0)) {
+        throw blocked("This click", "--count, --button and --modifiers need interact; at the read level only a plain single left click on a link or <summary> is allowed");
+      }
       const pg = await page();
       const loc = await locate(pg, ref);
       if (config.actions === "read") {
         const reason = await loc.evaluate(clickBlockReason);
         if (reason) throw blocked("This click", reason);
       }
-      await loc.click({ timeout: timeoutOf(p, ACTION_TIMEOUT_MS) });
+      await loc.click({ timeout: timeoutOf(p, ACTION_TIMEOUT_MS), clickCount: count, button, ...(modifiers.length ? { modifiers } : {}) });
       await pg.waitForLoadState("domcontentloaded", { timeout: capWait(5000) }).catch(() => {});
-      return { ...(await location(pg)), ref, tabs: context.pages().length };
+      return {
+        ...(await location(pg)),
+        ref,
+        tabs: context.pages().length,
+        ...(count !== 1 ? { count } : {}),
+        ...(button !== "left" ? { button } : {}),
+        ...(modifiers.length ? { modifiers } : {}),
+      };
     },
     async hover(p) {
       const ref = reqStr(p, "ref", "ref");
@@ -842,6 +1038,58 @@ export async function runDaemon(dir: string): Promise<void> {
       }
       return { ref, chars: value.length };
     },
+    async upload(p) {
+      const ref = reqStr(p, "ref", "ref");
+      const given = p.files;
+      if (!Array.isArray(given) || given.length === 0 || !given.every((f) => typeof f === "string" && f !== "")) {
+        throw new HoundError("MISSING_REQUIRED_FLAG", `--file is required (1 to ${UPLOAD_MAX_FILES} paths).`, { field: "file" });
+      }
+      if (config.actions === "read") throw blocked("upload");
+      // The safety checks come first: nothing is clicked or set before every file has been approved.
+      const files = await resolveUploadFiles(given as string[]);
+      const paths = files.map((f) => f.path);
+      const pg = await page();
+      const loc = await locate(pg, ref);
+      const asked = optInt(p, "timeoutMs", "timeout", 1, 600_000) ?? ACTION_TIMEOUT_MS;
+      const timeout = timeoutOf(p, ACTION_TIMEOUT_MS);
+      const t0 = Date.now();
+      const left = () => Math.max(1, timeout - (Date.now() - t0));
+      const isInput = await loc.evaluate((el) => el instanceof HTMLInputElement && el.type === "file");
+      try {
+        if (isInput) await loc.setInputFiles(paths, { timeout });
+        else {
+          // Like download: the chooser event is what matters; the click must not hold the op queue if it stays pending.
+          const waiter = nextFileChooser(pg, timeout);
+          const clicking = loc.click({ timeout }).then(
+            () => undefined,
+            (error: unknown) => ({ error }),
+          );
+          const first = await Promise.race([waiter.promise.then((c) => ({ c })), clicking.then((x) => ({ x }))]);
+          let chooser: FileChooser | null;
+          if ("c" in first) chooser = first.c;
+          else if (first.x) {
+            waiter.cancel();
+            throw first.x.error;
+          } else chooser = await waiter.promise;
+          if (!chooser) {
+            throw new HoundError("TIMEOUT", `No file chooser opened within ${formatSeconds(asked)} after clicking "${ref}"; it is not a file field or button; run page snapshot before retrying.`, {
+              field: "ref",
+              received: ref,
+              retryable: false,
+              suggestedFix: snapshotCmd,
+            });
+          }
+          await chooser.setFiles(paths, { timeout: left() });
+        }
+      } catch (err) {
+        if (/non-multiple/i.test(firstLine(err))) {
+          throw new HoundError("INVALID_ARGUMENT", `This file field accepts a single file; ${files.length} were given.`, { field: "file", received: files.length, retryable: true });
+        }
+        throw err;
+      }
+      return { ref, files: files.map(({ name, bytes }) => ({ name, bytes })) };
+    },
+
     async download(p) {
       const ref = reqStr(p, "ref", "ref");
       const output = await outputPath(p);
@@ -908,12 +1156,155 @@ export async function runDaemon(dir: string): Promise<void> {
       }
     },
 
+    async resize(p) {
+      assertViewport(p.width, p.height);
+      const pg = await page();
+      await pg.setViewportSize({ width: p.width as number, height: p.height as number });
+      return { viewport: pg.viewportSize() ?? { width: p.width as number, height: p.height as number } };
+    },
+
+    async emulate(p) {
+      const colorScheme = optEnum(p, "colorScheme", "color-scheme", ["light", "dark", "no-preference"] as const);
+      const media = optEnum(p, "media", "media", ["screen", "print"] as const);
+      const reducedMotion = optEnum(p, "reducedMotion", "reduced-motion", ["reduce", "no-preference"] as const);
+      const reset = p.reset === true;
+      if (reset && (colorScheme !== undefined || media !== undefined || reducedMotion !== undefined)) {
+        throw new HoundError("INVALID_ARGUMENT", "--reset cannot be combined with --color-scheme, --media or --reduced-motion.", { field: "reset", received: true });
+      }
+      if (!reset && colorScheme === undefined && media === undefined && reducedMotion === undefined) {
+        throw new HoundError("MISSING_REQUIRED_FLAG", "Give at least one of --color-scheme, --media, --reduced-motion or --reset.", {
+          field: "color-scheme|media|reduced-motion|reset",
+        });
+      }
+      const pg = await page();
+      if (reset) {
+        await pg.emulateMedia({ colorScheme: null, media: null, reducedMotion: null });
+        emulation = {};
+      } else {
+        await pg.emulateMedia({
+          ...(colorScheme !== undefined ? { colorScheme } : {}),
+          ...(media !== undefined ? { media } : {}),
+          ...(reducedMotion !== undefined ? { reducedMotion } : {}),
+        });
+        emulation = {
+          ...emulation,
+          ...(colorScheme !== undefined ? { colorScheme } : {}),
+          ...(media !== undefined ? { media } : {}),
+          ...(reducedMotion !== undefined ? { reducedMotion } : {}),
+        };
+      }
+      return { colorScheme: emulation.colorScheme ?? "default", media: emulation.media ?? "default", reducedMotion: emulation.reducedMotion ?? "default" };
+    },
+
+    async drag(p) {
+      const ref = reqStr(p, "ref", "ref");
+      const toRef = reqStr(p, "toRef", "to-ref");
+      if (ref === toRef) throw new HoundError("INVALID_ARGUMENT", "--ref and --to-ref are the same element.", { field: "to-ref", received: toRef });
+      if (config.actions === "read") throw blocked("drag");
+      const pg = await page();
+      const source = await locate(pg, ref);
+      const target = await locate(pg, toRef, "to-ref");
+      await source.dragTo(target, { timeout: timeoutOf(p, ACTION_TIMEOUT_MS) });
+      await pg.waitForLoadState("domcontentloaded", { timeout: capWait(5000) }).catch(() => {});
+      return { ...(await location(pg)), ref, toRef, tabs: context.pages().length };
+    },
+
+    async find(p) {
+      const text = optStr(p, "text", "text");
+      const regex = optStr(p, "regex", "regex");
+      if ((text === undefined) === (regex === undefined)) {
+        throw new HoundError("INVALID_ARGUMENT", "Give exactly one of --text or --regex.", { field: "text|regex", allowed: ["--text", "--regex"] });
+      }
+      if (text !== undefined && (text === "" || text.length > FIND_PATTERN_MAX_CHARS)) {
+        throw new HoundError("INVALID_ARGUMENT", `--text must be 1 to ${FIND_PATTERN_MAX_CHARS} characters.`, { field: "text", received: `${text.length} chars` });
+      }
+      const compiled = regex !== undefined ? parseRegexArg(regex) : undefined;
+      const limit = optInt(p, "limit", "limit", 1, FIND_LIMIT_MAX) ?? FIND_LIMIT_DEFAULT;
+      const context = optInt(p, "context", "context", 0, FIND_CONTEXT_MAX) ?? 0;
+      const pg = await page();
+      const full = sanitizeSnapshot(await pg.ariaSnapshot({ mode: "ai", timeout: timeoutOf(p, NAV_TIMEOUT_MS) }));
+      const cut = full.length > FIND_SNAPSHOT_MAX_CHARS;
+      let scanned = full;
+      if (cut) {
+        scanned = full.slice(0, FIND_SNAPSHOT_MAX_CHARS);
+        const nl = scanned.lastIndexOf("\n");
+        if (nl > 0) scanned = scanned.slice(0, nl);
+      }
+      const lines = scanned.split("\n");
+      const budget = Math.min(FIND_REGEX_BUDGET_MS, remainingMs());
+      if (compiled && budget < 100) throw new HoundError("TIMEOUT", "Timed out before the --regex scan could start; raise --timeout.", { field: "timeout", retryable: true });
+      const hits = compiled ? await matchRegex(lines, compiled.source, compiled.flags, budget) : matchText(lines, text!);
+      const shown = hits.slice(0, limit);
+      const tidy = (l: string | undefined) => clamp((l ?? "").trim(), 300);
+      const matches = shown.map((i) => {
+        const raw = lines[i] ?? "";
+        const ref = /\[ref=([a-z0-9]{1,32})\]/i.exec(raw)?.[1];
+        const before = context > 0 ? lines.slice(Math.max(0, i - context), i).map(tidy) : undefined;
+        const after = context > 0 ? lines.slice(i + 1, i + 1 + context).map(tidy) : undefined;
+        return { line: i + 1, ...(ref ? { ref } : {}), text: tidy(raw), ...(before ? { before } : {}), ...(after ? { after } : {}) };
+      });
+      const truncated = hits.length > shown.length;
+      let snapshotFile: string | undefined;
+      if (truncated || cut) {
+        snapshotFile = join(await runsDir(), `snapshot-${stamp()}.yml`);
+        await writeOutput(snapshotFile, full);
+      }
+      return { ...(await location(pg)), matches, total: hits.length, truncated, lines: lines.length, ...(cut ? { snapshotCut: true } : {}), ...(snapshotFile ? { snapshotFile } : {}) };
+    },
+
+    async read(p) {
+      const ref = reqStr(p, "ref", "ref");
+      const attr = optStr(p, "attr", "attr");
+      if (attr !== undefined && !new RegExp(ATTR_NAME_PATTERN).test(attr)) {
+        throw new HoundError("INVALID_ARGUMENT", "--attr must be an attribute name (letters, digits, '-', '_', ':', '.'; at most 64 characters).", { field: "attr", received: redactText(attr, 80) });
+      }
+      const limit = optInt(p, "limitChars", "limit-chars", 1, READ_LIMIT_MAX) ?? READ_LIMIT_DEFAULT;
+      const loc = await locate(await page(), ref);
+      // The page decides first: a password field's content never leaves it, only whitelisted descriptive attributes do.
+      const facts: ReadFacts = await loc.evaluate(
+        (el, [name, cap, safe, hint]) => {
+          const tag = el.tagName.toLowerCase();
+          let sensitive = false;
+          if (el instanceof HTMLInputElement || el instanceof HTMLTextAreaElement || el instanceof HTMLSelectElement) {
+            const type = el instanceof HTMLInputElement ? el.type : "";
+            const labels = Array.from(el.labels ?? []).map((l) => (l.textContent ?? "").slice(0, 100));
+            const words = [el.getAttribute("name"), el.id, el.getAttribute("autocomplete"), el.getAttribute("aria-label"), el.getAttribute("placeholder"), el.getAttribute("data-testid"), ...labels].join(" ");
+            sensitive = type === "password" || type === "hidden" || new RegExp(hint.source, hint.flags).test(words);
+          }
+          if (sensitive && !(typeof name === "string" && (safe as string[]).includes(name.toLowerCase()))) return { tag, sensitive, attr: null, text: "" };
+          if (typeof name === "string") {
+            const live = name.toLowerCase() === "value" && (el instanceof HTMLInputElement || el instanceof HTMLTextAreaElement || el instanceof HTMLSelectElement);
+            const v = live ? (el as HTMLInputElement).value : el.getAttribute(name);
+            return { tag, sensitive, attr: v === null ? null : v.slice(0, cap as number), text: "" };
+          }
+          return { tag, sensitive, attr: null, text: ((el as HTMLElement).innerText ?? el.textContent ?? "").slice(0, cap as number) };
+        },
+        [attr ?? null, READ_SCAN_MAX_CHARS, [...PASSWORD_SAFE_ATTRS], SENSITIVE_HINT] as const,
+        { timeout: timeoutOf(p, ACTION_TIMEOUT_MS) },
+      );
+      if (facts.sensitive && (attr === undefined || !PASSWORD_SAFE_ATTRS.includes(attr.toLowerCase()))) {
+        throw passwordBlocked(ref, attr === undefined ? "the text" : `the "${redactText(attr, 40)}" attribute`);
+      }
+      if (attr !== undefined) {
+        if (facts.attr === null) return { ref, attr, value: null, chars: 0, truncated: false };
+        const clean = redactAttr(attr, facts.attr);
+        return { ref, attr, value: clean.slice(0, limit), chars: clean.length, truncated: clean.length > limit };
+      }
+      const clean = scrubTokens(facts.text);
+      return { ref, text: clean.slice(0, limit), chars: clean.length, truncated: clean.length > limit };
+    },
+
     async console(p) {
       const level = optEnum(p, "level", "level", ["error", "warning", "all"] as const) ?? "error";
       const limit = optInt(p, "limit", "limit", 1, 500) ?? 20;
       const matching = level === "all" ? consoleRing : consoleRing.filter((e) => e.level === level);
       const entries = matching.slice(-limit);
       return { entries, total: matching.length, truncated: matching.length - entries.length };
+    },
+    async dialogs(p) {
+      const limit = optInt(p, "limit", "limit", 1, 500) ?? 20;
+      const entries = dialogRing.slice(-limit);
+      return { entries, total: dialogRing.length, truncated: dialogRing.length - entries.length };
     },
     async network(p) {
       const state = optEnum(p, "state", "state", ["failed", "all"] as const) ?? "failed";
@@ -1115,7 +1506,16 @@ export async function runDaemon(dir: string): Promise<void> {
       const t0 = Date.now();
       currentDeadline = deadline;
       try {
+        const { explicit, ...chosen } = dialogPolicy(op, params);
+        opPolicy = explicit ? chosen : undefined;
+        opLeaves = op === "navigate" || op === "back" || op === "forward" || op === "reload" || (op === "tabs" && params.action === "close");
+        opDialogs = [];
+        if (isStateChanging(op, params)) {
+          requestMark = requestSeq;
+          graceOp = undefined;
+        }
         const result = await fn(params);
+        if (opDialogs.length > 0 && result && typeof result === "object") (result as { dialogs?: DialogEntry[] }).dialogs = opDialogs;
         log(`op=${op} ms=${Date.now() - t0} ok`);
         if (op === "close") {
           pending--;
@@ -1125,10 +1525,15 @@ export async function runDaemon(dir: string): Promise<void> {
         reply({ id, ok: true, result });
       } catch (err) {
         const herr = toHoundError(err, op, params);
+        if (opDialogs && opDialogs.length > 0 && herr.details.data === undefined) herr.details.data = { dialogs: opDialogs };
         log(`op=${op} ms=${Date.now() - t0} err=${herr.code}`);
         reply({ id, ok: false, error: herr.toJSON() });
       } finally {
         currentDeadline = undefined;
+        if (opPolicy) graceOp = { op, policy: opPolicy, until: Date.now() + DIALOG_GRACE_MS };
+        opPolicy = undefined;
+        opLeaves = false;
+        opDialogs = undefined;
       }
       finish();
     });

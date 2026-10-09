@@ -36,8 +36,8 @@ const SECRET_KEY_RE = /cookie|auth|token|secret|password|credential/i;
 /** Attribute names that never carry anything the viewer needs and often carry secrets. */
 const ATTR_SECRET_RE = /cookie|auth|token|secret|password|credential|csrf|xsrf|nonce|api[-_]?key|session/i;
 /** Selector / element hints for fields whose typed value must not be recorded. */
-const HINT_RE =
-  /passw|token|secret|(^|[^a-z])otp([^a-z]|$)|one-time|cvv|cvc|card|cc-(number|csc|exp)|csrf|xsrf|credential|(^|[^a-z])(pin|ssn)([^a-z]|$)|api[-_]?key/i;
+export const HINT_RE =
+  /passw|pwd|token|secret|(^|[^a-z])otp([^a-z]|$)|one-time|cvv|cvc|card|cc-(number|csc|exp)|csrf|xsrf|credential|(^|[^a-z])(pin|ssn)([^a-z]|$)|api[-_]?key/i;
 const QUERY_SECRET_KEY_RE = /token|secret|pass|auth|key|sig|code|session|sid|jwt|credential|otp/i;
 
 const KEEP_HEADERS = new Set(["content-type", "content-length", "accept", "cache-control", "location"]);
@@ -69,8 +69,10 @@ const DROP_PARAMS: Record<string, Bucket> = {
   streams: "bodies",
   localpaths: "inputValues",
   localdirectory: "inputValues",
+  /** Dialog.accept: the answer given to a prompt() dialog. */
+  prompttext: "inputValues",
 };
-const VALUE_KEYS = new Set(["value", "text", "values", "options", "key", "expectedtext"]);
+const VALUE_KEYS = new Set(["value", "text", "values", "options", "key", "expectedtext", "prompttext"]);
 /** Serialized-argument params the trace viewer parses structurally (`{ value, handles }`). */
 const SERIALIZED_ARG_KEYS = new Set(["arg", "eventinit", "expectedvalue"]);
 /** Params that carry code or markup: never kept. */
@@ -88,6 +90,7 @@ const VALUE_METHODS = new Set([
   "ElementHandle.press",
   "ElementHandle.selectOption",
   "ElementHandle.setInputFiles",
+  "Dialog.accept",
   "Page.keyboardType",
   "Page.keyboardInsertText",
   "Page.keyboardPress",

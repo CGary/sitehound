@@ -9,6 +9,44 @@ export type ActionsLevel = "read" | "interact";
 export type DisplayMode = "headless" | "headed";
 export type SessionTraceMode = "off" | "on";
 export type WaitUntil = "load" | "domcontentloaded" | "networkidle";
+export type DialogAction = "accept" | "dismiss";
+export type ClickButton = "left" | "right" | "middle";
+export type ClickModifier = "Alt" | "Control" | "ControlOrMeta" | "Meta" | "Shift";
+export const CLICK_MODIFIERS: readonly ClickModifier[] = ["Alt", "Control", "ControlOrMeta", "Meta", "Shift"];
+export const WAIT_FOR = ["text", "text-gone", "url", "ref", "ref-hidden", "request", "load"] as const;
+export type WaitFor = (typeof WAIT_FOR)[number];
+export const REQUEST_METHODS = ["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"] as const;
+export type RequestMethod = (typeof REQUEST_METHODS)[number];
+
+/** One JavaScript dialog (alert, confirm, prompt, beforeunload) the daemon handled. */
+export interface DialogEntry {
+  time: string;
+  type: "alert" | "confirm" | "prompt" | "beforeunload";
+  /** Redacted (redactText), max 300 chars. The answer given to a prompt is never recorded. */
+  message: string;
+  action: DialogAction;
+  /** Only for a dialog raised after an op returned, while that op's --dialog override still applied (DIALOG_GRACE_MS): the op's name. */
+  op?: string;
+}
+
+/** Optional per-op dialog policy on ops that can trigger dialogs; `dialogText` answers a prompt (never echoed). */
+export interface DialogParams {
+  dialog?: DialogAction;
+  dialogText?: string;
+}
+
+/** Dialogs handled while the op ran (present only when there were any). */
+export interface Dialogged {
+  dialogs?: DialogEntry[];
+}
+
+export type ColorScheme = "light" | "dark" | "no-preference";
+export type MediaType = "screen" | "print";
+export type ReducedMotion = "reduce" | "no-preference";
+export interface Viewport {
+  width: number;
+  height: number;
+}
 
 export interface BrowserSessionInfo {
   name: string;
@@ -17,10 +55,17 @@ export interface BrowserSessionInfo {
   profile?: string;
   actions: ActionsLevel;
   display: DisplayMode;
+  /** Session default for JavaScript dialogs. */
+  dialog: DialogAction;
   trace: SessionTraceMode;
   startedAt: string;
   idleTimeoutMinutes: number;
   alive: boolean;
+  /** Size of the active tab's viewport (as set at open, or by `resize`). Present when the daemon answered. */
+  viewport?: Viewport;
+  /** Only when opened with a device scale factor / mobile emulation. */
+  deviceScaleFactor?: number;
+  mobile?: boolean;
   /** Active tab URL (stripped). Present when the daemon answered. */
   currentUrl?: string;
   tabs?: number;
@@ -31,9 +76,17 @@ export interface OpenBrowserSessionOptions {
   profile?: string;
   actions: ActionsLevel;
   display: DisplayMode;
+  /** Default for JavaScript dialogs (default "dismiss"); "accept" needs actions "interact". */
+  dialog?: DialogAction;
   /** Minutes of inactivity before the daemon exits: 1 to 1440 (fractions allowed). */
   idleTimeoutMinutes: number;
   trace: SessionTraceMode;
+  /** Initial viewport of every tab (default: Playwright's 1280x720). */
+  viewport?: Viewport;
+  /** 1..4 (default 1). */
+  deviceScaleFactor?: number;
+  /** Mobile emulation: isMobile + hasTouch. */
+  mobile?: boolean;
   /** How long to wait for the daemon to be ready. Default 30 000. */
   timeoutMs?: number;
 }
@@ -87,7 +140,7 @@ export interface BrowserOpMap {
   close: { params: Record<string, never>; result: { closed: true } };
 
   /** Only http(s) URLs and about:blank. Default waitUntil "load", timeout 30 000. */
-  navigate: { params: { url: string; waitUntil?: WaitUntil } & OpTimeout; result: PageLocation & { status: number | null } };
+  navigate: { params: { url: string; waitUntil?: WaitUntil } & DialogParams & OpTimeout; result: PageLocation & { status: number | null } & Dialogged };
   /**
    * `page.ariaSnapshot({ mode: "ai" })`. limitChars 1..200000, default 8000; depth 0..1000. When truncated (or `output` given) the
    * full text is written to `output` (absolute; the client resolves it against the caller's cwd) or to
@@ -103,18 +156,23 @@ export interface BrowserOpMap {
     result: { file: string; scope: "viewport" | "full" | "element"; url: string };
   };
   /**
-   * text: first element containing the text becomes visible; url: glob (when it has `*`; `**` any, `*` no "/")
-   * matched against the full URL or origin + path, else a substring of the full URL; ref: element visible; load: `value` is an optional WaitUntil (default "load").
-   * timeoutMs default 10 000 -> TIMEOUT.
+   * text: first visible element containing the text (inside `within`, a ref, when given); text-gone: no visible element contains
+   * it any more (also inside `within`); url: glob (when it has `*`; `**` any, `*` no "/") matched against the full URL or
+   * origin + path, else a substring of the full URL; ref: element visible; ref-hidden: element hidden or no longer on the page;
+   * text-gone / ref-hidden also return `wasPresent`: whether the text / element was visible when the wait began (false: it held at once).
+   * A vanished `within` ref counts as gone for text-gone. load: `value` is an optional WaitUntil (default "load").
+   * request: a finished request (response or failure) whose `network` index is greater than `sinceIndex` (default: the request
+   * counter when the last state-changing op of the session started) whose URL without query (and method, if given) matches `value`
+   * (a substring, or /regex/flags); the result then has `request` and `sinceIndex`. timeoutMs default 10 000 -> TIMEOUT.
    */
   wait: {
-    params: { for: "text" | "url" | "ref" | "load"; value?: string } & OpTimeout;
-    result: PageLocation & { waitedMs: number };
+    params: { for: WaitFor; value?: string; within?: string; method?: RequestMethod; sinceIndex?: number } & DialogParams & OpTimeout;
+    result: PageLocation & { waitedMs: number; wasPresent?: boolean; request?: { index: number; method: string; status?: number; failure?: string; url: string }; sinceIndex?: number } & Dialogged;
   };
   /** `moved` is false when there was no history entry to go to. */
-  back: { params: OpTimeout; result: PageLocation & { moved: boolean } };
-  forward: { params: OpTimeout; result: PageLocation & { moved: boolean } };
-  reload: { params: OpTimeout; result: PageLocation & { status: number | null } };
+  back: { params: DialogParams & OpTimeout; result: PageLocation & { moved: boolean } & Dialogged };
+  forward: { params: DialogParams & OpTimeout; result: PageLocation & { moved: boolean } & Dialogged };
+  reload: { params: DialogParams & OpTimeout; result: PageLocation & { status: number | null } & Dialogged };
   /** top/bottom ignore direction. */
   scroll: {
     params: { direction: "up" | "down"; amount: "page" | "half" | "top" | "bottom" };
@@ -125,19 +183,31 @@ export interface BrowserOpMap {
     params: { action: "list" | "select" | "close" | "new"; tabIndex?: number; url?: string } & OpTimeout;
     result: { tabs: TabInfo[]; active: number };
   };
-  /** Action timeout default 10 000. `tabs` is the tab count afterwards (a click may open a tab). */
-  click: { params: { ref: string } & OpTimeout; result: PageLocation & { ref: string; tabs: number } };
-  hover: { params: { ref: string } & OpTimeout; result: { ref: string } };
+  /**
+   * Action timeout default 10 000. `tabs` is the tab count afterwards (a click may open a tab). `count` 1..3 (double/triple
+   * click), `button`, `modifiers` (subset of CLICK_MODIFIERS): with actions "read" only a plain single left click can pass
+   * the link policy; any option needs "interact". The options are echoed back only when given.
+   */
+  click: {
+    params: { ref: string; count?: number; button?: ClickButton; modifiers?: ClickModifier[] } & DialogParams & OpTimeout;
+    result: PageLocation & { ref: string; tabs: number; count?: number; button?: ClickButton; modifiers?: ClickModifier[] } & Dialogged;
+  };
+  hover: { params: { ref: string } & OpTimeout; result: { ref: string } & Dialogged };
   /** The value is never echoed back; `chars` is its length. */
-  fill: { params: { ref: string; value: string } & OpTimeout; result: { ref: string; chars: number } };
+  fill: { params: { ref: string; value: string } & OpTimeout; result: { ref: string; chars: number } & Dialogged };
   /** Options match by value or label; `selected` are the resulting option values. */
-  select: { params: { ref: string; options: string[] } & OpTimeout; result: { ref: string; selected: string[] } };
+  select: { params: { ref: string; options: string[] } & DialogParams & OpTimeout; result: { ref: string; selected: string[] } & Dialogged };
   /** Playwright key name ("Enter", "Control+A"). Without ref it goes to the focused element. */
-  press: { params: { key: string; ref?: string } & OpTimeout; result: PageLocation & { key: string } };
+  press: { params: { key: string; ref?: string } & DialogParams & OpTimeout; result: PageLocation & { key: string } & Dialogged };
   /** level default "error" ("all" = error + warning); limit default 20. Newest last. */
   console: {
     params: { level?: "error" | "warning" | "all"; limit?: number };
     result: { entries: ConsoleEntry[]; total: number; truncated: number };
+  };
+  /** JavaScript dialogs the daemon handled (newest last; the last DIALOG_BUFFER_CAP are kept); limit default 20. */
+  dialogs: {
+    params: { limit?: number };
+    result: { entries: DialogEntry[]; total: number; truncated: number };
   };
   /** state default "failed" (request failures + status >= 400); limit default 20. Newest last. */
   network: {
@@ -149,15 +219,21 @@ export interface BrowserOpMap {
    * delayMs 0..1000 (default 30); value at most TYPE_MAX_CHARS. The value is never echoed back. The default op timeout
    * grows with chars x delay (typingTimeoutMs).
    */
-  type: { params: { ref: string; value: string; delayMs?: number; clear?: boolean } & OpTimeout; result: { ref: string; chars: number } };
+  type: { params: { ref: string; value: string; delayMs?: number; clear?: boolean } & DialogParams & OpTimeout; result: { ref: string; chars: number } & Dialogged };
+  /**
+   * Needs actions "interact". Sets the files (absolute paths, at most UPLOAD_MAX_FILES, UPLOAD_MAX_BYTES in total) on `ref`: an
+   * `<input type=file>` directly, anything else is clicked and the file chooser it opens is answered. Real paths are resolved;
+   * sitehound's own data, `.env*`, HAR/trace files and SSH/cloud credentials are refused (ACTION_BLOCKED). Only basenames are returned.
+   */
+  upload: { params: { ref: string; files: string[] } & DialogParams & OpTimeout; result: { ref: string; files: { name: string; bytes: number }[] } & Dialogged };
   /**
    * Clicks `ref` and saves the download it starts. Same read-level click policy as `click`. Without `output` the file goes to
    * `<HOUND_HOME>/runs/browser/<name>/downloads/` under its sanitized suggested name (a counter is added instead of overwriting);
    * `output` is absolute (the client resolves it). Default timeout 30 000 covers the click, the download start and the save.
    */
   download: {
-    params: { ref: string; output?: string; ifExists?: "error" | "overwrite" } & OpTimeout;
-    result: { file: string; bytes: number; suggestedFilename: string; url: string };
+    params: { ref: string; output?: string; ifExists?: "error" | "overwrite" } & DialogParams & OpTimeout;
+    result: { file: string; bytes: number; suggestedFilename: string; url: string } & Dialogged;
   };
   /**
    * One recorded request by its `network` index (the last REQUEST_BUFFER_CAP requests are kept). Returns the REDACTED body of the
@@ -185,6 +261,51 @@ export interface BrowserOpMap {
       omitted?: "binary" | "too-large";
     };
   };
+  /** Sets the active tab's viewport (width/height within the VIEWPORT_* limits); other tabs keep theirs. */
+  resize: { params: Viewport; result: { viewport: Viewport } };
+  /**
+   * `page.emulateMedia` on the active tab; the settings are kept for the session and applied to tabs opened later. A key left out is
+   * unchanged, `reset` clears all three (browser defaults). The result is what is in force: "default" = not emulated.
+   */
+  emulate: {
+    params: { colorScheme?: ColorScheme; media?: MediaType; reducedMotion?: ReducedMotion; reset?: boolean };
+    result: { colorScheme: ColorScheme | "default"; media: MediaType | "default"; reducedMotion: ReducedMotion | "default" };
+  };
+  /**
+   * Clicks `ref` and drags it onto `toRef` (`locator.dragTo`: pointer down, move to the target, up; HTML5 drag events included).
+   * Needs actions "interact". Same dialog policy as `click`. `tabs` is the tab count afterwards.
+   */
+  drag: { params: { ref: string; toRef: string } & DialogParams & OpTimeout; result: PageLocation & { ref: string; toRef: string; tabs: number } & Dialogged };
+  /**
+   * Fresh aria snapshot (same generator as `snapshot`, so the refs are valid afterwards) filtered to the lines matching `text`
+   * (case-insensitive substring) or `regex` (`/pattern/flags` with flags from imsu, or a bare pattern). Pattern at most
+   * FIND_PATTERN_MAX_CHARS; only the first FIND_LINE_MAX_CHARS of a line are examined and only the first FIND_SNAPSHOT_MAX_CHARS of the
+   * snapshot are scanned (`snapshotCut`); a regex runs in a worker thread with a FIND_REGEX_BUDGET_MS budget. limit 1..FIND_LIMIT_MAX
+   * (default FIND_LIMIT_DEFAULT), context 0..FIND_CONTEXT_MAX lines around each match (default 0). `snapshotFile` holds the full snapshot
+   * and is written only when matches were cut by the limit or the scan was cut.
+   */
+  find: {
+    params: { text?: string; regex?: string; limit?: number; context?: number } & OpTimeout;
+    result: PageLocation & {
+      matches: { line: number; ref?: string; text: string; before?: string[]; after?: string[] }[];
+      total: number;
+      truncated: boolean;
+      lines: number;
+      snapshotCut?: boolean;
+      snapshotFile?: string;
+    };
+  };
+  /**
+   * Reads one element: its `innerText` (default) or one attribute (`attr`; `value` on input/textarea/select is the current value).
+   * Redacted: tokens masked; URL attributes (href, src, action, formaction, data-*url*) lose query and fragment. A password input
+   * (type=password or autocomplete *-password) yields no text and only harmless attributes (ACTION_BLOCKED otherwise). `chars` is the
+   * length before cutting at limitChars (1..READ_LIMIT_MAX, default READ_LIMIT_DEFAULT; at most READ_SCAN_MAX_CHARS are read).
+   * `value` is null when the attribute is absent.
+   */
+  read: {
+    params: { ref: string; attr?: string; limitChars?: number } & OpTimeout;
+    result: { ref: string; attr?: string; text?: string; value?: string | null; chars: number; truncated: boolean };
+  };
   /** Only for sessions opened with trace "on". Writes a redacted trace; tracing restarts afterwards. */
   "trace-export": {
     params: Record<string, never>;
@@ -200,7 +321,8 @@ export type BrowserOpResult<O extends BrowserOp> = BrowserOpMap[O]["result"];
 
 export const BROWSER_OPS: readonly BrowserOp[] = [
   "ping", "status", "close", "navigate", "snapshot", "screenshot", "wait", "back", "forward", "reload",
-  "scroll", "tabs", "click", "hover", "fill", "select", "press", "type", "download", "console", "network", "request", "trace-export",
+  "scroll", "tabs", "click", "hover", "fill", "select", "press", "type", "upload", "download", "resize", "emulate", "drag", "find", "read",
+  "console", "dialogs", "network", "request", "trace-export",
 ];
 
 /** Socket protocol: one JSON object per line. */
@@ -221,8 +343,14 @@ export interface DaemonConfig {
   profile?: string;
   actions: ActionsLevel;
   display: DisplayMode;
+  /** Absent in configs written by older versions: "dismiss". */
+  dialog?: DialogAction;
   trace: SessionTraceMode;
   idleTimeoutMinutes: number;
+  /** Absent in configs written by older versions: Playwright's default viewport. */
+  viewport?: Viewport;
+  deviceScaleFactor?: number;
+  mobile?: boolean;
 }
 
 /** Written by the daemon once it is ready (state.json, 0600). */

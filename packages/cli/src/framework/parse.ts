@@ -268,6 +268,15 @@ function validateRules(cmd: Command, input: Input, given: Record<string, unknown
       throw bad(cmd, given, `Flags are mutually exclusive, give exactly one of: ${flags}`, group.join("|"), { received: present.map((n) => `--${n}`) });
     }
   }
+  for (const group of cmd.requiresAny ?? []) {
+    if (group.some((n) => isPresent(given, n))) continue;
+    throw new HoundError("MISSING_REQUIRED_FLAG", `Provide at least one of: ${group.map((n) => `--${n}`).join(", ")}`, {
+      field: group.join("|"),
+      allowed: group.map((n) => `--${n}`),
+      retryable: true,
+      suggestedFix: usageLine(cmd, given),
+    });
+  }
   for (const group of cmd.confirm ?? []) {
     const present = group.oneOf.filter((n) => isPresent(given, n));
     const flags = group.oneOf.map((n) => `--${n}`).join(" or ");

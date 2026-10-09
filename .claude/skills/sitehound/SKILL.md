@@ -25,9 +25,20 @@ Run it as `hound` (on the PATH; fallback `/home/gary/dev/sitehound/bin/hound`). 
 hound browser open --session-name shop --json
 hound page navigate --session-name shop --url https://example.com --json
 hound page snapshot --session-name shop --limit-chars 4000 --json   # refs like e12 or f3e4
+hound page find --session-name shop --text "add to cart" --json                  # cheap: matching lines + refs, not the whole snapshot
 hound element click --session-name shop --ref e12 --json
+hound element read --session-name shop --ref e12 --attr href --json             # text or one attribute (masked; password/card/OTP-like fields blocked)
+hound element drag --session-name shop --ref e12 --to-ref e30 --json             # interact; takes --dialog like click
+hound page resize --session-name shop --viewport 375x812 --json                  # or browser open --viewport 375x812 --mobile
+hound page emulate --session-name shop --color-scheme dark --media print --json  # --reduced-motion, --reset
 hound element type --session-name shop --ref e7 --value "mar" --clear --json    # real key events (interact)
 hound element download --session-name shop --ref e30 --json                      # click + save the file; data.file
+hound element upload --session-name shop --ref e9 --file ./invoice.pdf --json    # input[type=file] or its button (interact)
+hound element click --session-name shop --ref e7 --dialog accept --json          # confirm a "Delete?" dialog (interact)
+hound element click --session-name shop --ref e7 --count 2 --button right --modifiers Shift --json   # interact
+hound page wait --session-name shop --for text-gone --value "Cargando" --within e41 --json   # also ref-hidden, request
+hound page wait --session-name shop --for request --value /api/orders --method POST --json   # after a click; then diag request
+hound diag dialogs --session-name shop --json                                    # dialogs the session handled
 hound diag network --session-name shop --state all --json                        # each request has an index
 hound diag request --session-name shop --index 14 --part request-body --json     # redacted body, no headers
 hound browser close --session-name shop --json
@@ -38,7 +49,7 @@ hound profile list --json
 hound browser list --json
 ```
 
-Use `element type` (not `fill`) for search-as-you-type fields and comboboxes; it needs `--actions interact`. Downloads and request bodies follow the same file-location rules below (`data.file`, `--output`, `--if-exists`). Never paste bodies or downloaded files into reports.
+Prefer `page find --text|--regex` over reading a whole snapshot on big pages (refs it returns work with `element` commands). Use `element type` (not `fill`) for search-as-you-type fields and comboboxes; it needs `--actions interact`. Dialogs (alert, confirm, prompt, beforeunload) are dismissed by default and listed in `data.dialogs` (navigate/back/forward/reload always accept `beforeunload`; a late dialog within 2 s of an override shows in `diag dialogs`); accept one (`--dialog accept`, optional `--dialog-text` for prompts, or `browser open --dialog accept`) only when the user asked for that action, and it needs `--actions interact`. Upload only files the user named, never secrets: `.hound/`, `.env*`, HAR/trace files, SSH/cloud keys, browser profiles and credential files are refused (`ACTION_BLOCKED`). `page wait --for text` matches text anywhere unless you pass `--within <ref>`. Downloads and request bodies follow the same file-location rules below (`data.file`, `--output`, `--if-exists`). Never paste bodies or downloaded files into reports.
 
 ## Where to write files (`--output`, `--file`, scripts)
 

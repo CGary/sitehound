@@ -5,9 +5,9 @@ import { usageLine } from "./usage.ts";
 
 export const DOMAIN_DESCRIPTIONS: Record<string, string> = {
   browser: "Open, close and inspect persistent browser sessions",
-  page: "Navigate, read, wait and screenshot the current page of a session",
-  element: "Click, fill, type, select, press keys and download from page elements by ref",
-  diag: "Console, network, request-body and trace diagnostics of a session",
+  page: "Navigate, read, search, wait, resize, emulate and screenshot the current page of a session",
+  element: "Click, drag, read, fill, type, select, press keys, upload and download from page elements by ref",
+  diag: "Console, dialog, network, request-body and trace diagnostics of a session",
   profile: "Saved logins: list, check, log in (human), delete",
   task: "Built-in capture tasks (snapshot, component): list and run",
   script: "Run a single-file test/extraction script",

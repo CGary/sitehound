@@ -230,7 +230,7 @@ describe("schema = validation", () => {
     const shot = await schemaOf(env, ["page", "screenshot"]);
     assert.deepEqual(shot.input.conditional[0], { when: { scope: "element" }, require: ["ref"] });
     const wait = await schemaOf(env, ["page", "wait"]);
-    assert.ok(wait.input.conditional.some((r: any) => r.require?.includes("value") && r.when.for.join() === "text,url,ref"));
+    assert.ok(wait.input.conditional.some((r: any) => r.require?.includes("value") && r.when.for.join() === "text,text-gone,url,ref,ref-hidden,request"));
     const tabs = await schemaOf(env, ["page", "tabs"]);
     assert.ok(tabs.input.conditional.some((r: any) => r.when.action === "new" && r.require.includes("url")));
     assert.ok(tabs.input.conditional.some((r: any) => Array.isArray(r.when.action) && r.when.action.join() === "select,close" && r.require.includes("tab-index")));

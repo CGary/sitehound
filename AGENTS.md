@@ -68,7 +68,7 @@ Examples include `--json`; keep it on every call. Session names use letters, dig
 9. Check a saved login: `hound profile check --profile work --json` (add `--site <origin>` to check one site). Read `data.state`.
 10. List what exists: `hound profile list --json`, `hound browser list --json`, `hound task list --json`.
 
-Other useful verbs: `page wait --for text|url|ref|load --value <v>`, `page scroll`, `page tabs`, `page screenshot`, `element hover|select|press`, `element type` (real key events, for search-as-you-type fields; interact), `element download` (click and save the file; `data.file`), `diag console`, `diag network` (failed requests by default; each has an `index`), `diag request --index <n> --part request-body|response-body` (redacted body, never headers; the last 500 requests are kept). Run `hound <domain> <verb> --schema` for flags.
+Other useful verbs: `page find --text <s>|--regex </re/i>` (matching snapshot lines with refs; `--limit 1..200`, `--context 0..3`; the cheap alternative to a full `page snapshot`), `page resize --viewport 375x812` and `browser open --viewport WxH [--device-scale-factor 1..4] [--mobile]`, `page emulate --color-scheme|--media|--reduced-motion|--reset`, `element read --ref <r> [--attr <name>]` (text or one attribute, redacted; password, hidden, card, OTP, CSRF-like fields give `ACTION_BLOCKED`), `element drag --ref <r> --to-ref <r>` (interact; takes `--dialog`/`--dialog-text`), `page wait --for text|text-gone|url|ref|ref-hidden|request|load --value <v>` (`--within <ref>` scopes text; `text-gone`/`ref-hidden` return `wasPresent`, false when the target was never visible; `--for request` matches a finished request after the last click, `--method`, `--since-index`, value = substring or `/regex/imsu` of at most 200 characters; result has `index` for `diag request`), `page scroll`, `page tabs`, `page screenshot`, `element hover|select|press`, `element click` (`--count 1..3`, `--button`, `--modifiers`: interact), `element type` (real key events, for search-as-you-type fields; interact), `element upload --ref <r> --file <path>...` (interact; only files the user named, never secrets: `.hound/`, `.env*`, HAR/trace, SSH/cloud/docker/kube keys and config, browser profiles, shell histories and credential files are refused with `ACTION_BLOCKED`; hard-linked files are refused, copy them first; 20 files, 50 MiB), `element download` (click and save the file; `data.file`), `diag dialogs`, `diag console`, `diag network` (failed requests by default; each has an `index`), `diag request --index <n> --part request-body|response-body` (redacted body, never headers; the last 500 requests are kept). Run `hound <domain> <verb> --schema` for flags.
 
 ## Error handling
 
@@ -77,7 +77,7 @@ Other useful verbs: `page wait --for text|url|ref|load --value <v>`, `page scrol
 - `CONFIRMATION_REQUIRED` (exit 2): `profile delete` needs `--dry-run` or `--yes`; `profile login` on an existing profile needs an explicit `--mode extend|replace`. Pick one of `data.alternatives`.
 - `TIMEOUT` on a state-changing action: the action may have been applied. `page snapshot` first, then decide.
 - `REF_NOT_FOUND`: the page changed. Run `page snapshot` again and use the new refs.
-- `ACTION_BLOCKED`: the session is read-only. Do not reopen it with `--actions interact` on your own. Ask the user first, then close and reopen it.
+- `ACTION_BLOCKED`: the session is read-only. Do not reopen it with `--actions interact` on your own. Ask the user first, then close and reopen it. For `element upload` (`field: file`) it means the file is protected: do not look for a way around it.
 - `NO_TTY` from `profile login` (not retryable; the message holds the command for the human), or a profile that checks `expired`: stop and ask the human to log in. Agents cannot log in. Do not try to re-authenticate.
 - `SESSION_NOT_FOUND`: run `browser list` and open the session again.
 - `PROFILE_NOT_FOUND`: run `profile list`; do not guess names.
@@ -86,9 +86,13 @@ Other useful verbs: `page wait --for text|url|ref|load --value <v>`, `page scrol
 - `retryable: false`: fix the input before retrying.
 - Report the error code and the next step to the user. Do not paste page content into the report.
 
+## Dialogs
+
+JavaScript dialogs (alert, confirm, prompt, beforeunload) never hang a session. They are dismissed by default (`browser open --dialog dismiss`); each action that handled one reports `data.dialogs: [{type, message, action}]`, and `diag dialogs` lists the last 100. Accept only when the user asked for the action behind the dialog (for example "delete this record"): `--dialog accept` (and `--dialog-text` for a prompt, never echoed) on `element click|press|select|type|download|upload|drag` and `page navigate|back|forward|reload`, or `browser open --dialog accept`. Accepting needs `--actions interact`. `page navigate|back|forward|reload` always accept a `beforeunload` dialog (leaving is what you asked for) and report it in `data.dialogs`. An override also covers a dialog raised by a timer or request within 2 s after the action returned; it shows in `diag dialogs` (with `op`) and in the `data.dialogs` of any op running then (such as `page wait`).
+
 ## Read level and what it blocks
 
-Browser sessions default to `--actions read`. It allows navigation, reading, screenshots, scrolling, hovering, waits, tabs, diagnostics, and clicks on real http(s) links (not `#fragment` links) and `<summary>`. It blocks fills, selects, key presses, and clicks on buttons, submit controls or anything inside a form (`ACTION_BLOCKED`). GET links with side effects (such as `/logout`) are not detected: do not click them blindly.
+Browser sessions default to `--actions read`. It allows navigation, reading, screenshots, scrolling, hovering, waits, tabs, diagnostics, and clicks on real http(s) links (not `#fragment` links) and `<summary>`, with a plain single left click. It blocks fills, selects, key presses, uploads, drags, accepting dialogs, `--count`/`--button`/`--modifiers` clicks, and clicks on buttons, submit controls or anything inside a form (`ACTION_BLOCKED`). GET links with side effects (such as `/logout`) are not detected: do not click them blindly.
 
 ## Privacy and hard rules
 
