@@ -63,13 +63,16 @@ export async function runCli(argv: readonly string[], registry: Registry, hooks:
     return text(rootHelp(registry, hooks.version));
   }
   if (!registry.domains().includes(domain)) return fail(verb ? `${domain}.${verb}` : domain, unknownCommand(registry, domain, verb));
-  if (!verb) return text(domainHelp(registry, domain));
-  const cmd = registry.find(domain, verb);
+  // A top-level command ("batch") has no verb: a second word is an unexpected positional argument for it.
+  const solo = registry.find(domain, undefined);
+  if (!verb && !solo) return text(domainHelp(registry, domain));
+  const cmd = solo ?? registry.find(domain, verb);
   if (!cmd) return fail(`${domain}.${verb}`, unknownCommand(registry, domain, verb));
+  const cmdArgs = solo && verb !== undefined ? [verb, ...rest] : rest;
 
   configure({ command: cmd.name });
   // Re-scan knowing the command: the token after a value-taking flag is its value (`--value -h` is not help).
-  const known = scanUniversal(rest, cmd);
+  const known = scanUniversal(cmdArgs, cmd);
   if (known.help) return text(commandHelp(cmd));
   if (known.schema) return text(JSON.stringify(commandSchema(cmd), null, 2));
   if (known.version) return text(hooks.version);
@@ -77,7 +80,7 @@ export async function runCli(argv: readonly string[], registry: Registry, hooks:
   const cwd = process.cwd();
   let parsed: ReturnType<typeof parseFlags>;
   try {
-    parsed = parseFlags(cmd, rest, cwd);
+    parsed = parseFlags(cmd, cmdArgs, cwd);
   } catch (err) {
     return fail(cmd.name, err);
   }
@@ -119,7 +122,8 @@ function unknownFlagAtRoot(token: string): HoundError {
   });
 }
 
-async function withTimeout(cmd: Command, input: Record<string, unknown>, ctx: CommandContext, controller: AbortController, seconds?: number): Promise<CommandResult> {
+/** Runs `cmd` with `input`; rejects with TIMEOUT (and aborts `controller`) after `seconds` when given. */
+export async function withTimeout(cmd: Command, input: Record<string, unknown>, ctx: CommandContext, controller: AbortController, seconds?: number): Promise<CommandResult> {
   const running = cmd.run(input, ctx);
   if (!seconds) return running;
   let timer: ReturnType<typeof setTimeout> | undefined;

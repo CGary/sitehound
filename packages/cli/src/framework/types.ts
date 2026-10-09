@@ -102,7 +102,7 @@ export interface CommandContext {
 }
 
 export interface Command {
-  /** "domain.verb". */
+  /** "domain.verb", or a bare "domain" for a top-level command with no verb (e.g. "batch"). */
   name: string;
   /** One line. */
   description: string;
@@ -122,6 +122,11 @@ export interface Command {
   confirm?: readonly { oneOf: readonly string[]; message: string }[];
   /** Cross-field cost rules (see CostRule). */
   costRules?: readonly CostRule[];
+  /**
+   * Shape of a structured input the command reads from a file or stdin (e.g. batch steps), shown by --schema as
+   * `input.file_format`. Free-form JSON: describe fields, limits and any reference syntax there, not in prose elsewhere.
+   */
+  fileFormat?: Record<string, unknown>;
   /** Exactly 3 complete example commands. */
   examples: readonly [string, string, string];
   /** Default --timeout in seconds when the caller gives none. Omit for no limit. */

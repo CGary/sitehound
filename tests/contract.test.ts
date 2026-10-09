@@ -6,13 +6,16 @@ import { makeEnv, type Env } from "./helpers/hound.ts";
 /** The final command catalog (docs/cli contract). Every one must be registered. */
 const CATALOG = [
   "browser open", "browser close", "browser list", "browser status",
-  "page navigate", "page snapshot", "page find", "page screenshot", "page wait", "page back", "page forward", "page reload", "page scroll", "page tabs", "page resize", "page emulate",
-  "element click", "element drag", "element read", "element hover", "element fill", "element select", "element press", "element type", "element download", "element upload",
+  "page navigate", "page snapshot", "page find", "page screenshot", "page pdf", "page wait", "page back", "page forward", "page reload", "page scroll", "page tabs", "page resize", "page emulate",
+  "element click", "element drag", "element check", "element uncheck", "element read", "element hover", "element fill", "element select", "element press", "element type", "element download", "element upload",
   "diag console", "diag network", "diag request", "diag dialogs", "diag trace",
   "profile list", "profile check", "profile login", "profile delete",
-  "task list", "task run", "script run",
+  "task list", "task run", "script run", "script export",
+  "batch",
 ];
-const DOMAINS = ["browser", "page", "element", "diag", "profile", "task", "script"];
+const DOMAINS = ["browser", "page", "element", "diag", "profile", "task", "script", "batch"];
+/** Top-level commands without a verb: `hound batch --help` is the command's own help. */
+const SOLO = new Set(["batch"]);
 
 describe("cli contract", () => {
   let env: Env;
@@ -28,6 +31,11 @@ describe("cli contract", () => {
     for (const domain of DOMAINS) {
       const r = await env.raw([domain, "--help"]);
       assert.equal(r.exitCode, 0);
+      if (SOLO.has(domain)) {
+        assert.match(r.stdout, new RegExp(`^hound ${domain} — `), `${domain} --help is its command help`);
+        found.push(domain);
+        continue;
+      }
       for (const line of r.stdout.split("\n")) {
         const m = new RegExp(`^  (${domain} [a-z-]+)\\s`).exec(line);
         if (m) found.push(m[1]!);

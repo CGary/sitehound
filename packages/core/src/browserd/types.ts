@@ -4,6 +4,7 @@
  * it resolves to. URLs in results are stripped (origin + path, see stripUrl); file paths are absolute.
  */
 import type { ErrorCode, HoundErrorDetails } from "../errors.ts";
+import type { BlockCategory, Geolocation, PdfFormat } from "./limits.ts";
 
 export type ActionsLevel = "read" | "interact";
 export type DisplayMode = "headless" | "headed";
@@ -66,6 +67,11 @@ export interface BrowserSessionInfo {
   /** Only when opened with a device scale factor / mobile emulation. */
   deviceScaleFactor?: number;
   mobile?: boolean;
+  /** Only when opened with --block / --locale / --timezone / --geolocation. */
+  block?: BlockCategory[];
+  locale?: string;
+  timezone?: string;
+  geolocation?: Geolocation;
   /** Active tab URL (stripped). Present when the daemon answered. */
   currentUrl?: string;
   tabs?: number;
@@ -87,6 +93,14 @@ export interface OpenBrowserSessionOptions {
   deviceScaleFactor?: number;
   /** Mobile emulation: isMobile + hasTouch. */
   mobile?: boolean;
+  /** Request categories the session refuses (see block.ts). */
+  block?: BlockCategory[];
+  /** BCP 47 language tag (navigator.language, Accept-Language, Intl). */
+  locale?: string;
+  /** IANA time zone name. */
+  timezone?: string;
+  /** Fixed position for navigator.geolocation; also grants the geolocation permission. */
+  geolocation?: Geolocation;
   /** How long to wait for the daemon to be ready. Default 30 000. */
   timeoutMs?: number;
 }
@@ -129,6 +143,60 @@ export interface NetworkEntry {
   resourceType: string;
   /** Redacted failure reason for requests that never got a response. */
   failure?: string;
+  /** Set when the session's --block refused the request (then `failure` is "blocked"): such requests are listed with `state all` only, never as failures. */
+  blocked?: BlockCategory;
+}
+
+/**
+ * How `script export` finds an element again once its ref is gone, chosen before the action ran (see recorder.ts):
+ * the first of test id, role + accessible name, label, placeholder, exact text, `#id`, short CSS path that matched exactly
+ * that one element. `ambiguous` (with `nth`, the element's index among the matches of the best candidate) when none was
+ * unique; kind "none" when nothing could be described in time. `frame`: the element is inside an iframe (not replayable as is).
+ */
+export interface LocatorDesc {
+  kind: "testid" | "role" | "label" | "placeholder" | "text" | "css" | "none";
+  /** kind role: the ARIA role. */
+  role?: string;
+  /** The test id, accessible name, label, placeholder, text or CSS selector. */
+  value?: string;
+  nth?: number;
+  ambiguous?: boolean;
+  frame?: boolean;
+  /** Short description for comments and parameter names, e.g. textbox "Email" (clamped, one line). */
+  hint: string;
+}
+
+/** A URL of the action log as exported: origin + path (token-like segments masked) unless `includeQuery`. */
+export interface ExportedUrl {
+  url: string;
+  /** Path for assertions ("" for about:blank and non-http URLs). */
+  path: string;
+  /** A token-like path segment was replaced by ":token" (the URL will not replay as is). */
+  masked: boolean;
+}
+
+export const RECORDED_OPS = ["navigate", "click", "hover", "fill", "type", "select", "press", "check", "drag", "upload", "download", "back", "forward", "reload", "tabs", "wait", "resize", "emulate"] as const;
+export type RecordedOp = (typeof RECORDED_OPS)[number];
+
+/**
+ * One successful state-changing, navigation or wait op of the session, for `script export`. Never holds typed or filled
+ * values, dialog answers or upload paths: those become script parameters. `details` holds only option values, keys,
+ * wait conditions, sizes and flags.
+ */
+export interface ExportedAction {
+  seq: number;
+  op: RecordedOp;
+  /** Active tab before and after the op. */
+  before: ExportedUrl;
+  after: ExportedUrl;
+  /** navigate / tabs new: the URL that was opened. */
+  goto?: ExportedUrl;
+  target?: LocatorDesc;
+  /** drag: the drop target. */
+  to?: LocatorDesc;
+  /** wait --within. */
+  within?: LocatorDesc;
+  details: Record<string, string | number | boolean | string[]>;
 }
 
 export interface BrowserOpMap {
@@ -145,14 +213,20 @@ export interface BrowserOpMap {
    * `page.ariaSnapshot({ mode: "ai" })`. limitChars 1..200000, default 8000; depth 0..1000. When truncated (or `output` given) the
    * full text is written to `output` (absolute; the client resolves it against the caller's cwd) or to
    * `<HOUND_HOME>/runs/browser/<name>/snapshot-<ts>.yml`, and `file` is set.
+   * `ref`: snapshot only that element's subtree (`locator.ariaSnapshot`; its refs are the same as in a full snapshot, so they stay
+   * valid for element commands). `diff`: compare with the previous snapshot of the same tab taken with the same `ref` and `depth`
+   * (any snapshot op, diff or not, replaces that baseline; the last SNAPSHOT_BASELINES_PER_TAB combinations are kept per tab):
+   * `snapshot` is then the unified line diff (see snapdiff.ts; "" when nothing changed) with `added`/`removed` line counts and
+   * `baseline: true`; without a baseline `snapshot` is the full snapshot and `baseline` is false. `truncated`, `totalChars`, `file`
+   * and `output` then refer to the diff text; `refs` counts the refs of the whole current snapshot.
    */
   snapshot: {
-    params: { depth?: number; limitChars?: number; output?: string } & OpTimeout;
-    result: PageLocation & { snapshot: string; truncated: boolean; totalChars: number; refs: number; file?: string };
+    params: { depth?: number; limitChars?: number; output?: string; ifExists?: "error" | "overwrite"; ref?: string; diff?: boolean } & OpTimeout;
+    result: PageLocation & { snapshot: string; truncated: boolean; totalChars: number; refs: number; file?: string; diff?: { added: number; removed: number; baseline: boolean } };
   };
   /** PNG under `<HOUND_HOME>/runs/browser/<name>/` (or `output`, absolute). scope default "viewport"; "element" needs `ref`. */
   screenshot: {
-    params: { scope?: "viewport" | "full" | "element"; ref?: string; output?: string } & OpTimeout;
+    params: { scope?: "viewport" | "full" | "element"; ref?: string; output?: string; ifExists?: "error" | "overwrite" } & OpTimeout;
     result: { file: string; scope: "viewport" | "full" | "element"; url: string };
   };
   /**
@@ -261,6 +335,21 @@ export interface BrowserOpMap {
       omitted?: "binary" | "too-large";
     };
   };
+  /**
+   * Idempotently sets a checkbox, radio or switch (`<input type=checkbox|radio>`, or role checkbox/radio/switch with aria-checked) to
+   * `checked` (`locator.setChecked`). Needs actions "interact". `changed` is false when it already was in that state (nothing is
+   * clicked). A radio cannot be unchecked (INVALID_ARGUMENT). Same dialog policy as `click`.
+   */
+  check: { params: { ref: string; checked: boolean } & DialogParams & OpTimeout; result: { ref: string; checked: boolean; changed: boolean } & Dialogged };
+  /**
+   * `page.pdf()` of the active tab (headless Chromium only; a headed session gives INVALID_ARGUMENT, field display). `format`
+   * default "A4". Written to `output` (absolute) or `<HOUND_HOME>/runs/browser/<name>/page-<ts>.pdf` (0600); `pages` is counted from the
+   * file when it can be read from it.
+   */
+  pdf: {
+    params: { output?: string; ifExists?: "error" | "overwrite"; format?: PdfFormat; landscape?: boolean; background?: boolean } & OpTimeout;
+    result: { file: string; bytes: number; url: string; format: PdfFormat; landscape: boolean; background: boolean; pages?: number };
+  };
   /** Sets the active tab's viewport (width/height within the VIEWPORT_* limits); other tabs keep theirs. */
   resize: { params: Viewport; result: { viewport: Viewport } };
   /**
@@ -272,10 +361,13 @@ export interface BrowserOpMap {
     result: { colorScheme: ColorScheme | "default"; media: MediaType | "default"; reducedMotion: ReducedMotion | "default" };
   };
   /**
-   * Clicks `ref` and drags it onto `toRef` (`locator.dragTo`: pointer down, move to the target, up; HTML5 drag events included).
+   * Drags `ref` onto `toRef`. method "html5": `locator.dragTo` (pointer down, one move to the target, up; HTML5 drag events included); "mouse": a real pointer path (move to the source centre, press, `steps` 1..50 moves to the target centre, release); "auto" (default): dragTo first, then the pointer path when the page did not react (no dragstart, same URL/DOM/requests) or dragTo failed. `method` in the result is the one that ran, `fellBack` is set when auto changed to the pointer path.
    * Needs actions "interact". Same dialog policy as `click`. `tabs` is the tab count afterwards.
    */
-  drag: { params: { ref: string; toRef: string } & DialogParams & OpTimeout; result: PageLocation & { ref: string; toRef: string; tabs: number } & Dialogged };
+  drag: {
+    params: { ref: string; toRef: string; method?: "auto" | "html5" | "mouse"; steps?: number } & DialogParams & OpTimeout;
+    result: PageLocation & { ref: string; toRef: string; tabs: number; method: "html5" | "mouse"; fellBack?: true } & Dialogged;
+  };
   /**
    * Fresh aria snapshot (same generator as `snapshot`, so the refs are valid afterwards) filtered to the lines matching `text`
    * (case-insensitive substring) or `regex` (`/pattern/flags` with flags from imsu, or a bare pattern). Pattern at most
@@ -306,6 +398,20 @@ export interface BrowserOpMap {
     params: { ref: string; attr?: string; limitChars?: number } & OpTimeout;
     result: { ref: string; attr?: string; text?: string; value?: string | null; chars: number; truncated: boolean };
   };
+  /**
+   * The session's action log (the last ACTION_LOG_CAP successful recorded ops, oldest first; in memory only) for
+   * `script export`, with the session settings a replay needs. URLs are origin + path unless `includeQuery`.
+   */
+  actions: {
+    params: { includeQuery?: boolean };
+    result: {
+      session: { name: string; profile?: string; actions: ActionsLevel; dialog: DialogAction; viewport?: Viewport; mobile?: boolean; deviceScaleFactor?: number; locale?: string; timezone?: string; geolocation?: Geolocation; block?: BlockCategory[] };
+      actions: ExportedAction[];
+      /** Actions recorded since the session started, and how many of them were dropped from the front of the log. */
+      recorded: number;
+      dropped: number;
+    };
+  };
   /** Only for sessions opened with trace "on". Writes a redacted trace; tracing restarts afterwards. */
   "trace-export": {
     params: Record<string, never>;
@@ -321,8 +427,8 @@ export type BrowserOpResult<O extends BrowserOp> = BrowserOpMap[O]["result"];
 
 export const BROWSER_OPS: readonly BrowserOp[] = [
   "ping", "status", "close", "navigate", "snapshot", "screenshot", "wait", "back", "forward", "reload",
-  "scroll", "tabs", "click", "hover", "fill", "select", "press", "type", "upload", "download", "resize", "emulate", "drag", "find", "read",
-  "console", "dialogs", "network", "request", "trace-export",
+  "scroll", "tabs", "click", "hover", "fill", "select", "press", "type", "upload", "download", "resize", "emulate", "drag", "find", "read", "check", "pdf",
+  "console", "dialogs", "network", "request", "trace-export", "actions",
 ];
 
 /** Socket protocol: one JSON object per line. */
@@ -351,6 +457,10 @@ export interface DaemonConfig {
   viewport?: Viewport;
   deviceScaleFactor?: number;
   mobile?: boolean;
+  block?: BlockCategory[];
+  locale?: string;
+  timezone?: string;
+  geolocation?: Geolocation;
 }
 
 /** Written by the daemon once it is ready (state.json, 0600). */

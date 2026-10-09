@@ -82,6 +82,8 @@ const NAME_KEYS = new Set(["name", "key", "field", "fieldname", "field_name", "i
 const VALUE_KEYS = new Set(["value", "val", "v", "values"]);
 const CARD_PARENT_RE = /card|^cc|payment|credit/i;
 const CARD_FIELDS = new Set(["number", "num", "no", "pan", "code"]);
+/** A key or parent key that says its string values are card data. */
+const isCardKey = (key: string): boolean => CARD_PARENT_RE.test(key) || /(?:^|[^a-z])(?:pan|tarjeta)(?:[^a-z]|$)/i.test(key);
 
 function luhn(digits: string): boolean {
   let sum = 0;
@@ -99,11 +101,47 @@ function luhn(digits: string): boolean {
 }
 
 const PAN_RE = /(?<!\d)(?:\d[ -]?){12,18}\d(?!\d)/g;
-/** Masks 13-19 digit runs (spaces/dashes allowed) that pass the Luhn check: card numbers. */
-export function maskPans(text: string): string {
-  return text.replace(PAN_RE, (m) => {
+/** Digit groups typical of cards, one separator kind throughout: 4-4-4-(1..7) (13-19 digits), Amex 4-6-5, Diners 4-6-4. */
+const PAN_GROUPED_RE = /^(?:\d{4}([ -])\d{4}\1\d{4}\1\d{1,7}|\d{4}([ -])\d{6}\2\d{4,5})$/;
+/**
+ * Issuer table for numbers without a card context or card-like grouping: IIN prefix and the lengths that brand uses.
+ * Visa 4 (13, 16, 19); Mastercard 51-55 and 2221-2720 (16); Amex 34/37 (15); Discover 6011, 644-649, 65 (16-19); Diners 30[0-5], 3095, 36, 38, 39 (14);
+ * JCB 35 (16-19); UnionPay 62 (16-19); Mir 2200-2204 (16-19); Maestro and other 50, 56-69 (13-19).
+ * Numbers that start with anything else (epoch milliseconds start with 1) are never masked on shape alone.
+ */
+const PAN_BRANDS: ReadonlyArray<{ prefix: RegExp; lengths: readonly number[] }> = [
+  { prefix: /^4/, lengths: [13, 16, 19] },
+  { prefix: /^(?:5[1-5]|2(?:22[1-9]|2[3-9]\d|[3-6]\d{2}|7[01]\d|720))/, lengths: [16] },
+  { prefix: /^3[47]/, lengths: [15] },
+  { prefix: /^(?:6011|64[4-9]|65)/, lengths: [16, 17, 18, 19] },
+  { prefix: /^(?:30[0-5]|3095|3[689])/, lengths: [14] },
+  { prefix: /^35/, lengths: [16, 17, 18, 19] },
+  { prefix: /^62/, lengths: [16, 17, 18, 19] },
+  { prefix: /^220[0-4]/, lengths: [16, 17, 18, 19] },
+  { prefix: /^(?:50|5[6-9]|6\d)/, lengths: [13, 14, 15, 16, 17, 18, 19] },
+];
+const knownBrand = (digits: string): boolean => PAN_BRANDS.some((b) => b.prefix.test(digits) && b.lengths.includes(digits.length));
+/** Words just before a number that say it is a card number (the lookback is one line, 40 characters). */
+const PAN_BEFORE_RE = /(?<![a-z])(?:card|cc|pan|tarjeta|credit|debit|visa|mastercard|amex)(?![a-z])[^\d\n]{0,40}$/i;
+
+/** Does this digit run pass Luhn AND look like a card (hint, card-like grouping, or a known issuer prefix at that brand's length)? */
+function looksLikePan(raw: string, digits: string, hinted: boolean): boolean {
+  if (digits.length < 13 || digits.length > 19 || !luhn(digits)) return false;
+  return hinted || PAN_GROUPED_RE.test(raw) || knownBrand(digits);
+}
+
+/**
+ * Masks card numbers: 13-19 digits (single spaces or dashes allowed between groups) that pass the Luhn check AND are card-like:
+ * the caller says the text is a card field (`cardContext`: key or parent such as `card.number`), or a card word precedes the
+ * number, or the digits are grouped like a card (4-4-4-4, 4-6-5), or they start with an issuer prefix at that brand's length
+ * (see PAN_BRANDS: Visa, Mastercard, Amex, Discover, Diners, JCB, UnionPay, Mir, Maestro). Other long numbers that happen to pass Luhn (epoch milliseconds, ids) are kept.
+ */
+export function maskPans(text: string, cardContext = false): string {
+  return text.replace(PAN_RE, (m, offset: number) => {
     const digits = m.replace(/[ -]/g, "");
-    return digits.length >= 13 && digits.length <= 19 && luhn(digits) ? "[pan]" : m;
+    const lineStart = text.lastIndexOf("\n", offset - 1) + 1;
+    const before = text.slice(Math.max(lineStart, offset - 60), offset);
+    return looksLikePan(m, digits, cardContext || PAN_BEFORE_RE.test(before)) ? "[pan]" : m;
   });
 }
 
@@ -208,9 +246,9 @@ function inChunks(text: string, fn: (piece: string) => string): string {
 }
 
 /** Free-text redaction: secret assignments and markup first, then URLs, secret pairs, tokens and card numbers. Never cuts the text. */
-function redactPlain(text: string): string {
+function redactPlain(text: string, cardContext = false): string {
   const marked = scrubMarkup(scrubAssignments(text));
-  return inChunks(marked, (piece) => maskPans(redactText(piece, Number.POSITIVE_INFINITY)));
+  return inChunks(marked, (piece) => maskPans(redactText(piece, Number.POSITIVE_INFINITY), cardContext));
 }
 
 const looksJson = (s: string): boolean => {
@@ -219,7 +257,7 @@ const looksJson = (s: string): boolean => {
 };
 
 /** One string value (or key): a JSON document inside a string is parsed and redacted structurally; anything else as free text. */
-function cleanString(s: string, depth: number): string {
+function cleanString(s: string, depth: number, cardContext = false): string {
   if (depth < MAX_DEPTH && looksJson(s)) {
     try {
       return JSON.stringify(redactJsonValue(JSON.parse(s), depth + 1));
@@ -227,7 +265,7 @@ function cleanString(s: string, depth: number): string {
       // not JSON: free text below
     }
   }
-  return redactPlain(s);
+  return redactPlain(s, cardContext);
 }
 
 const cleanKey = (k: string): string => {
@@ -235,11 +273,11 @@ const cleanKey = (k: string): string => {
   return c.length > 200 ? `${c.slice(0, 200)}…` : c;
 };
 
-function redactJsonValue(value: unknown, depth: number, parentKey = ""): unknown {
-  if (typeof value === "string") return cleanString(value, depth);
+function redactJsonValue(value: unknown, depth: number, parentKey = "", inCard = false): unknown {
+  if (typeof value === "string") return cleanString(value, depth, inCard || isCardKey(parentKey));
   if (value === null || typeof value !== "object") return value;
   if (depth >= MAX_DEPTH) return "[truncated]";
-  if (Array.isArray(value)) return value.map((v) => redactJsonValue(v, depth + 1, parentKey));
+  if (Array.isArray(value)) return value.map((v) => redactJsonValue(v, depth + 1, parentKey, inCard));
   const entries = Object.entries(value);
   const secretName = entries.some(([k, v]) => NAME_KEYS.has(k.toLowerCase()) && typeof v === "string" && isSecretKey(v));
   const cardContext = CARD_PARENT_RE.test(parentKey);
@@ -247,7 +285,7 @@ function redactJsonValue(value: unknown, depth: number, parentKey = ""): unknown
   for (const [k, v] of entries) {
     const lower = k.toLowerCase();
     const secret = isSecretKey(k) || (secretName && VALUE_KEYS.has(lower)) || (cardContext && CARD_FIELDS.has(lower));
-    out[cleanKey(k)] = secret ? REDACTED : redactJsonValue(v, depth + 1, k);
+    out[cleanKey(k)] = secret ? REDACTED : redactJsonValue(v, depth + 1, k, inCard || isCardKey(parentKey));
   }
   return out;
 }
@@ -329,7 +367,7 @@ function redactForm(raw: string): RedactedBody {
   const secretName = pairs.some(([k, v]) => NAME_KEYS.has(k.toLowerCase()) && isSecretKey(v));
   const lines = pairs.map(([k, v]) => {
     const secret = isSecretKey(k) || (secretName && VALUE_KEYS.has(k.toLowerCase()));
-    return `${cleanKey(k)}=${secret ? REDACTED : cleanString(v, 0)}`;
+    return `${cleanKey(k)}=${secret ? REDACTED : cleanString(v, 0, isCardKey(k))}`;
   });
   if (new URLSearchParams(raw).size > MAX_FORM_PAIRS) lines.push("[more fields omitted]");
   return { format: "form", text: lines.join("\n") };
@@ -362,7 +400,7 @@ function redactMultipart(buf: Buffer, boundary: string): string {
       lines.push(`${label}: ${isFile ? "file, " : ""}${size} bytes`);
       continue;
     }
-    const value = isSecretKey(decodedName) ? REDACTED : cleanString(Buffer.from(body, "latin1").toString("utf8"), 0);
+    const value = isSecretKey(decodedName) ? REDACTED : cleanString(Buffer.from(body, "latin1").toString("utf8"), 0, isCardKey(decodedName));
     lines.push(`${label}: ${size} bytes, value ${JSON.stringify(value)}`);
   }
   return lines.join("\n");

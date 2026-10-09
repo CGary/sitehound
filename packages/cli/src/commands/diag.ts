@@ -44,11 +44,11 @@ function requestActions(session: string, entries: { index: number; method: strin
 
 export const diagNetwork = defineCommand({
   name: "diag.network",
-  description: "Read failed requests (or all requests) collected since the session started. Each has a stable index for diag request. URLs have no query or fragment.",
+  description: "Read failed requests (or all requests) collected since the session started. Each has a stable index for diag request. URLs have no query or fragment. Requests refused by browser open --block are marked failure \"blocked\" (plus blocked: the category) and listed only with --state all, never as failures.",
   kind: "read",
   flags: {
     ...SESSION_FLAG,
-    state: { type: "enum", values: ["failed", "all"], default: "failed", description: "failed = request failures and HTTP status >= 400" },
+    state: { type: "enum", values: ["failed", "all"], default: "failed", description: "failed = request failures and HTTP status >= 400 (not requests refused by --block); all = every request, blocked ones included" },
     limit: LIMIT_FLAG,
   },
   examples: [

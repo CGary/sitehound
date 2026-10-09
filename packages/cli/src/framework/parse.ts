@@ -62,6 +62,9 @@ export function scanUniversal(argv: readonly string[], cmd?: Command): Pick<Univ
   };
 }
 
+/** Stand-in value of a deferred flag while the rules are checked (never sent to a command). */
+const DEFERRED = "\u0000deferred";
+
 function bad(cmd: Command, given: Record<string, unknown>, message: string, field: string, extra: { received?: unknown; allowed?: readonly string[] } = {}): HoundError {
   return new HoundError("INVALID_ARGUMENT", message, { field, ...extra, retryable: true, suggestedFix: usageLine(cmd, given) });
 }
@@ -70,8 +73,17 @@ function bad(cmd: Command, given: Record<string, unknown>, message: string, fiel
  * Splits argv (after the `domain verb` tokens) into universal flags and the command's own typed input.
  * Accepts `--key value` and `--key=value`; booleans never consume the next token.
  */
-export function parseFlags(cmd: Command, argv: readonly string[], cwd: string): { input: Input; universal: Universal; given: ReadonlySet<string> } {
+export function parseFlags(
+  cmd: Command,
+  argv: readonly string[],
+  cwd: string,
+  opts: { deferred?: ReadonlySet<string> } = {},
+): { input: Input; universal: Universal; given: ReadonlySet<string> } {
   const given: Record<string, unknown> = {};
+  // Deferred flags (batch references such as "$prev.matches.0.ref") count as given for every presence rule; their
+  // values are only known later, when the command is parsed again with them filled in.
+  const deferred = opts.deferred ?? new Set<string>();
+  for (const name of deferred) if (cmd.flags[name]) given[name] = DEFERRED;
   const raw: Record<string, string[] | true[]> = {};
   const universalRaw: Record<string, string | true> = {};
   const allowedFlags = [...Object.keys(cmd.flags), ...Object.keys(UNIVERSAL_FLAGS)].map((n) => `--${n}`);
@@ -119,6 +131,10 @@ export function parseFlags(cmd: Command, argv: readonly string[], cwd: string): 
 
   const input: Input = {};
   for (const [name, spec] of Object.entries(cmd.flags)) {
+    if (deferred.has(name)) {
+      input[name] = DEFERRED;
+      continue;
+    }
     const vals = raw[name];
     if (!vals) {
       if (spec.default !== undefined) input[name] = spec.default;
@@ -156,8 +172,11 @@ export function parseFlags(cmd: Command, argv: readonly string[], cwd: string): 
 
 /** A value-taking flag followed by a token that starts with "-": ask for the `--flag=value` form. */
 function dashValue(cmd: Command, given: Record<string, unknown>, name: string, spec: FlagSpec, token: string): HoundError {
-  const shown = token.slice(0, 80);
   const isFlag = /^--[A-Za-z]/.test(token);
+  // A token like "--value=secret" is the next flag with its value glued on: never echo the value of a sensitive flag.
+  const glued = /^--([A-Za-z][\w-]*)=/.exec(token);
+  const leaks = glued !== null && (cmd.flags[glued[1]!]?.sensitive === true);
+  const shown = leaks ? `--${glued![1]}=<value>` : token.slice(0, 80);
   const fix = isFlag || spec.sensitive || name === "value" ? usageLine(cmd, given, { [name]: placeholder(name, spec) }) : usageLine(cmd, given, { [name]: token });
   const hint = spec.sensitive ? `--${name}=<value>` : `--${name}=${shown}`;
   return new HoundError(
@@ -320,6 +339,6 @@ function checkRule(cmd: Command, rule: ConditionalRule, input: Input, given: Rec
   }
   for (const [name, values] of Object.entries(rule.restrict ?? {})) {
     const v = input[name];
-    if (typeof v === "string" && !values.includes(v)) throw invalidEnum(cmd, given, name, `--${name}`, v, values, ` when ${when}`);
+    if (typeof v === "string" && v !== DEFERRED && !values.includes(v)) throw invalidEnum(cmd, given, name, `--${name}`, v, values, ` when ${when}`);
   }
 }

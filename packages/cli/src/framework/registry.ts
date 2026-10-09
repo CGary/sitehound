@@ -10,7 +10,8 @@ export const DOMAIN_DESCRIPTIONS: Record<string, string> = {
   diag: "Console, dialog, network, request-body and trace diagnostics of a session",
   profile: "Saved logins: list, check, log in (human), delete",
   task: "Built-in capture tasks (snapshot, component): list and run",
-  script: "Run a single-file test/extraction script",
+  script: "Run a single-file test/extraction script, or export a session's actions as one",
+  batch: "Run several page/element/diag steps of one session in a single call",
 };
 
 export interface Registry {
@@ -18,23 +19,24 @@ export interface Registry {
   byName: ReadonlyMap<string, Command>;
   domains(): string[];
   verbs(domain: string): Command[];
+  /** `domain verb`, or the top-level command named `domain` when `verb` is undefined. */
   find(domain: string | undefined, verb: string | undefined): Command | undefined;
 }
 
 export function buildRegistry(commands: readonly Command[]): Registry {
   const byName = new Map<string, Command>();
   for (const c of commands) {
-    if (!/^[a-z]+\.[a-z-]+$/.test(c.name)) throw new Error(`Bad command name "${c.name}" (want domain.verb)`);
+    if (!/^[a-z]+(?:\.[a-z-]+)?$/.test(c.name)) throw new Error(`Bad command name "${c.name}" (want domain.verb or domain)`);
     if (byName.has(c.name)) throw new Error(`Duplicate command "${c.name}"`);
     byName.set(c.name, c);
   }
-  const split = (c: Command) => c.name.split(".") as [string, string];
+  const split = (c: Command) => c.name.split(".") as [string, string?];
   return {
     commands,
     byName,
     domains: () => [...new Set(commands.map((c) => split(c)[0]))],
     verbs: (domain) => commands.filter((c) => split(c)[0] === domain),
-    find: (domain, verb) => (domain && verb ? byName.get(`${domain}.${verb}`) : undefined),
+    find: (domain, verb) => (domain ? byName.get(verb ? `${domain}.${verb}` : domain) : undefined),
   };
 }
 

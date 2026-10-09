@@ -39,6 +39,7 @@ export function commandSchema(cmd: Command): unknown {
       }),
       properties: Object.fromEntries(Object.entries(cmd.flags).map(([n, s]) => [n, property(s)])),
       universal: Object.keys(UNIVERSAL_FLAGS),
+      ...(cmd.fileFormat && { file_format: cmd.fileFormat }),
     },
     output: { type: "object", required: ["ok", "command", "summary", "data"] },
     ...(cmd.timeoutSeconds && { default_timeout_seconds: cmd.timeoutSeconds }),

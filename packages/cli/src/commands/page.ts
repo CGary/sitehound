@@ -1,5 +1,5 @@
 import type { WaitFor } from "@sitehound/core";
-import { FIND_CONTEXT_MAX, FIND_LIMIT_DEFAULT, FIND_LIMIT_MAX, FIND_PATTERN_MAX_CHARS } from "@sitehound/core/limits";
+import { FIND_CONTEXT_MAX, PDF_FORMATS, FIND_LIMIT_DEFAULT, FIND_LIMIT_MAX, FIND_PATTERN_MAX_CHARS } from "@sitehound/core/limits";
 import { defineCommand } from "../framework/types.ts";
 import type { NextAction } from "../framework/types.ts";
 import { DIALOG_FLAGS, DIALOG_RULES, REF_RULE, SESSION_FLAG, VIEWPORT_DESCRIPTION, VIEWPORT_RULE, callSession, dialogData, dialogNote, dialogParams, sessionCmd, snapshotAction, viewportFlag } from "./browser-shared.ts";
@@ -48,18 +48,25 @@ export const pageNavigate = defineCommand({
 
 export const pageSnapshot = defineCommand({
   name: "page.snapshot",
-  description: "Read the page as an accessibility tree with [ref=eN] element refs; large output is truncated and saved to a file.",
+  description:
+    "Read the page as an accessibility tree with [ref=eN] element refs; large output is truncated and saved to a file. --ref reads only one element's subtree and --diff only what changed since the previous snapshot of the tab: both cut tokens on big pages.",
   kind: "read",
   flags: {
     ...SESSION_FLAG,
+    ref: { type: "string", ...REF_RULE, description: "Snapshot only this element's subtree (a ref from an earlier snapshot, e.g. e12). Refs inside it are the same as in a full snapshot and work for element commands" },
+    diff: {
+      type: "boolean",
+      description:
+        "Return only the lines added (+) and removed (-) since the previous snapshot of this tab taken with the same --ref and --depth, as a unified diff (@@ hunks, 1 line of context, refs kept). The first call has no baseline: it returns the full snapshot (data.baseline false). Every snapshot, diff or not, becomes the new baseline. --limit-chars, --output and the saved file then hold the diff text",
+    },
     depth: { type: "integer", min: 0, max: 1000, description: "Maximum tree depth (0 or omitted: unlimited)" },
     "limit-chars": { type: "integer", default: 8000, min: 1, max: 200000, description: "Max snapshot characters returned inline; the full text goes to a file when exceeded" },
     ...OUTPUT_FLAGS,
   },
   examples: [
     "hound page snapshot --session-name demo --json",
-    "hound page snapshot --session-name demo --depth 4 --limit-chars 4000 --json",
-    "hound page snapshot --session-name demo --output ./page.yml --if-exists overwrite --limit-chars 2000 --json",
+    "hound page snapshot --session-name demo --ref e12 --depth 4 --limit-chars 4000 --json",
+    "hound page snapshot --session-name demo --diff --json",
   ],
   async run(input, ctx) {
     const s: string = input["session-name"];
@@ -67,15 +74,27 @@ export const pageSnapshot = defineCommand({
     const r = await callSession(ctx, s, "snapshot", {
       ...(input.depth !== undefined && { depth: input.depth }),
       limitChars: input["limit-chars"],
-      ...(input.output && { output: input.output }),
+      ...(input.ref && { ref: input.ref }),
+      ...(input.diff && { diff: true }),
+      ...(input.output && { output: input.output, ifExists: input["if-exists"] }),
     });
     const next: NextAction[] = [
       { command: sessionCmd("element", "click", s, "--ref", "<ref>"), reason: "Click an element (replace <ref> with a ref from this snapshot, e.g. e12)." },
       { command: sessionCmd("element", "fill", s, "--ref", "<ref>", "--value", "<text>"), reason: "Fill a field (replace <ref> and <text>; needs --actions interact)." },
     ];
     if (r.file) next.push(readFileAction(r.file, r.truncated ? "Read the full snapshot." : "Read the saved snapshot."));
+    const scope = input.ref ? `${input.ref} on ` : "";
+    const d = r.diff;
+    if (d?.baseline) {
+      return {
+        summary: d.added + d.removed === 0 ? `No changes in ${scope}${r.url} since the last snapshot.` : `Snapshot diff of ${scope}${r.url}: +${d.added} -${d.removed} lines${r.truncated ? " (truncated)" : ""}; ${r.refs} refs on the page.`,
+        data: { url: r.url, title: r.title, refs: r.refs, truncated: r.truncated, totalChars: r.totalChars, ...(r.file && { file: r.file }), baseline: true, added: d.added, removed: d.removed, diff: r.snapshot },
+        plain: r.snapshot || "No changes.",
+        next_actions: next,
+      };
+    }
     return {
-      summary: `Snapshot of ${r.url}: ${r.refs} refs, ${r.totalChars} chars${r.truncated ? " (truncated)" : ""}.`,
+      summary: `Snapshot of ${scope}${r.url}: ${r.refs} refs, ${r.totalChars} chars${r.truncated ? " (truncated)" : ""}${d ? "; no earlier snapshot to compare with, this is the full snapshot" : ""}.`,
       data: {
         url: r.url,
         title: r.title,
@@ -83,10 +102,46 @@ export const pageSnapshot = defineCommand({
         truncated: r.truncated,
         totalChars: r.totalChars,
         ...(r.file && { file: r.file }),
+        ...(d && { baseline: false, added: d.added, removed: 0, diff: "" }),
         snapshot: r.snapshot,
       },
       plain: r.snapshot,
       next_actions: next,
+    };
+  },
+});
+
+export const pagePdf = defineCommand({
+  name: "page.pdf",
+  description: "Print the active tab to a PDF file and return its path (headless sessions only; uses the print stylesheet unless page emulate set screen). Default file in the session's runs directory (0600).",
+  kind: "read",
+  flags: {
+    ...SESSION_FLAG,
+    ...OUTPUT_FLAGS,
+    output: { ...OUTPUT_FLAGS.output!, description: "Write the PDF to this file instead of the session's runs directory (relative paths resolve against the current directory; refuses directories and symlinks)" },
+    format: { type: "enum", values: PDF_FORMATS, default: "A4", description: "Paper size" },
+    landscape: { type: "boolean", description: "Landscape orientation (default portrait)" },
+    background: { type: "boolean", description: "Print CSS backgrounds and background images (off by default, like a browser's print dialog)" },
+  },
+  examples: [
+    "hound page pdf --session-name demo --json",
+    "hound page pdf --session-name demo --format Letter --landscape --background --json",
+    "hound page pdf --session-name demo --output ./invoice.pdf --if-exists overwrite --json",
+  ],
+  async run(input, ctx) {
+    const s: string = input["session-name"];
+    if (input.output) await checkOutputPath(this, givenInput(input, ctx), input.output, input["if-exists"]);
+    const r = await callSession(ctx, s, "pdf", {
+      format: input.format,
+      ...(input.landscape && { landscape: true }),
+      ...(input.background && { background: true }),
+      ...(input.output && { output: input.output, ifExists: input["if-exists"] }),
+    });
+    return {
+      summary: `Saved a ${r.format} PDF of ${r.url} (${r.bytes} bytes${r.pages !== undefined ? `, ${r.pages} page(s)` : ""}).`,
+      data: { file: r.file, bytes: r.bytes, ...(r.pages !== undefined && { pages: r.pages }), format: r.format, landscape: r.landscape, background: r.background, url: r.url },
+      plain: r.file,
+      next_actions: afterRead(s),
     };
   },
 });
@@ -117,7 +172,7 @@ export const pageScreenshot = defineCommand({
     const r = await callSession(ctx, s, "screenshot", {
       scope: input.scope,
       ...(input.ref && { ref: input.ref }),
-      ...(input.output && { output: input.output }),
+      ...(input.output && { output: input.output, ifExists: input["if-exists"] }),
     });
     return {
       summary: `Saved ${r.scope} screenshot of ${r.url}.`,
@@ -444,4 +499,4 @@ export const pageTabs = defineCommand({
   },
 });
 
-export const pageCommands = [pageNavigate, pageSnapshot, pageFind, pageScreenshot, pageWait, pageBack, pageForward, pageReload, pageScroll, pageTabs, pageResize, pageEmulate];
+export const pageCommands = [pageNavigate, pageSnapshot, pageFind, pageScreenshot, pagePdf, pageWait, pageBack, pageForward, pageReload, pageScroll, pageTabs, pageResize, pageEmulate];

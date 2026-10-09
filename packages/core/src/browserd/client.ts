@@ -17,8 +17,12 @@ import {
   LOG_FILE,
   PID_FILE,
   STARTUP_ERROR_FILE,
+  assertBlock,
   assertDeviceScaleFactor,
+  assertGeolocation,
   assertIdleTimeout,
+  assertLocale,
+  assertTimezone,
   assertViewport,
   isDaemonProcess,
   isPidAlive,
@@ -52,7 +56,7 @@ const CLIENT_MARGIN_MS = 2_000;
 const PING_TIMEOUT_MS = 500;
 const OPS_WITH_TIMEOUT = new Set<BrowserOp>([
   "navigate", "snapshot", "screenshot", "wait", "back", "forward", "reload", "tabs", "click", "hover", "fill", "select", "press", "type", "upload", "download", "request",
-  "drag", "find", "read",
+  "drag", "find", "read", "check", "pdf",
 ]);
 
 const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
@@ -86,6 +90,10 @@ function infoFrom(state: DaemonConfig & { pid: number; startedAt: string }, aliv
     ...(state.viewport ? { viewport: state.viewport } : {}),
     ...(state.deviceScaleFactor !== undefined ? { deviceScaleFactor: state.deviceScaleFactor } : {}),
     ...(state.mobile ? { mobile: true } : {}),
+    ...(state.block?.length ? { block: state.block } : {}),
+    ...(state.locale ? { locale: state.locale } : {}),
+    ...(state.timezone ? { timezone: state.timezone } : {}),
+    ...(state.geolocation ? { geolocation: state.geolocation } : {}),
   };
 }
 
@@ -328,6 +336,10 @@ export async function openBrowserSession(opts: OpenBrowserSessionOptions): Promi
   assertIdleTimeout(opts.idleTimeoutMinutes);
   if (opts.viewport !== undefined) assertViewport(opts.viewport.width, opts.viewport.height);
   if (opts.deviceScaleFactor !== undefined) assertDeviceScaleFactor(opts.deviceScaleFactor);
+  if (opts.block !== undefined) assertBlock(opts.block);
+  if (opts.locale !== undefined) assertLocale(opts.locale);
+  if (opts.timezone !== undefined) assertTimezone(opts.timezone);
+  if (opts.geolocation !== undefined) assertGeolocation(opts.geolocation);
   if (profile !== undefined && !hasProfile(profile)) {
     throw new HoundError("PROFILE_NOT_FOUND", `Profile "${profile}" not found.`, {
       field: "profile",
@@ -351,6 +363,10 @@ export async function openBrowserSession(opts: OpenBrowserSessionOptions): Promi
     ...(opts.viewport ? { viewport: { width: opts.viewport.width, height: opts.viewport.height } } : {}),
     ...(opts.deviceScaleFactor !== undefined ? { deviceScaleFactor: opts.deviceScaleFactor } : {}),
     ...(opts.mobile ? { mobile: true } : {}),
+    ...(opts.block?.length ? { block: [...new Set(opts.block)] } : {}),
+    ...(opts.locale ? { locale: opts.locale } : {}),
+    ...(opts.timezone ? { timezone: opts.timezone } : {}),
+    ...(opts.geolocation ? { geolocation: { latitude: opts.geolocation.latitude, longitude: opts.geolocation.longitude, ...(opts.geolocation.accuracy !== undefined ? { accuracy: opts.geolocation.accuracy } : {}) } } : {}),
   };
   await writePrivateJson(join(dir, CONFIG_FILE), config);
 

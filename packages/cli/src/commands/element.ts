@@ -2,7 +2,7 @@ import { existsSync, statSync } from "node:fs";
 import { readFile } from "node:fs/promises";
 import type { ClickModifier } from "@sitehound/core";
 import { HoundError } from "@sitehound/core/errors";
-import { ATTR_NAME_PATTERN, MAX_OP_TIMEOUT_MS, READ_LIMIT_DEFAULT, READ_LIMIT_MAX, TYPE_MAX_CHARS, TYPING_BASE_MS, TYPING_EXTRA_MS_PER_KEY, UPLOAD_MAX_BYTES, UPLOAD_MAX_FILES } from "@sitehound/core/limits";
+import { ATTR_NAME_PATTERN, DRAG_METHODS, DRAG_STEPS_DEFAULT, DRAG_STEPS_MAX, DRAG_STEPS_MIN, MAX_OP_TIMEOUT_MS, READ_LIMIT_DEFAULT, READ_LIMIT_MAX, TYPE_MAX_CHARS, TYPING_BASE_MS, TYPING_EXTRA_MS_PER_KEY, UPLOAD_MAX_BYTES, UPLOAD_MAX_FILES } from "@sitehound/core/limits";
 import { defineCommand } from "../framework/types.ts";
 import { checkCostRules, checkMaxChars } from "../framework/rules.ts";
 import type { FlagSpec } from "../framework/types.ts";
@@ -20,7 +20,7 @@ const MODIFIER_NAMES = "Alt|Control|ControlOrMeta|Meta|Shift";
 export const elementClick = defineCommand({
   name: "element.click",
   description:
-    "Click an element by ref. The read level only clicks real http(s) links and <summary> with a plain single left click (GET links with side effects, e.g. /logout, are not detected); everything else, including --count/--button/--modifiers, needs --actions interact.",
+    "Click an element by ref. The read level only clicks real http(s) links and <summary> with a plain single left click, and refuses links that look like GET side effects (e.g. /logout, or sign out, delete, remove, unsubscribe, cerrar sesión, eliminar in the URL path, query or link text: ACTION_BLOCKED); everything else, including --count/--button/--modifiers, needs --actions interact.",
   kind: "write",
   flags: {
     ...SESSION_FLAG,
@@ -72,30 +72,65 @@ export const elementClick = defineCommand({
 export const elementDrag = defineCommand({
   name: "element.drag",
   description:
-    "Drag an element onto another by ref (pointer down on the source, move to the target, release; HTML5 drag-and-drop events included). Needs --actions interact. Libraries that need several intermediate pointer moves may not react: check the page afterwards.",
+    "Drag an element onto another by ref. --method auto (default) tries HTML5 drag-and-drop first (pointer down, one move, release) and, when the page did not react or that failed, repeats with a real pointer path of --steps intermediate moves, for libraries that need them (data.method says which ran). Needs --actions interact. Check the page afterwards: a page that reacts in ways sitehound cannot see may be dragged twice.",
   kind: "write",
   flags: {
     ...SESSION_FLAG,
     ref: { ...REF_FLAG, description: "Source element ref (what is dragged), e.g. e12" },
     "to-ref": { type: "string", required: true, ...REF_RULE, description: "Target element ref (where it is dropped), e.g. e30" },
+    method: {
+      type: "enum",
+      values: DRAG_METHODS,
+      default: "auto",
+      description: "auto: HTML5 drag-and-drop first, a real pointer path when the page did not react; html5: only drag-and-drop; mouse: only the pointer path (move to the source, press, --steps moves to the target, release)",
+    },
+    steps: { type: "integer", default: DRAG_STEPS_DEFAULT, min: DRAG_STEPS_MIN, max: DRAG_STEPS_MAX, description: "Pointer moves between source and target on the pointer path (--method mouse, or auto when it falls back)" },
     ...DIALOG_FLAGS,
   },
   requiresWhen: DIALOG_RULES,
   examples: [
     "hound element drag --session-name demo --ref e12 --to-ref e30 --json",
     "hound element drag --session-name demo --ref e4 --to-ref e9 --dialog accept --json",
-    "hound element drag --session-name work --ref e7 --to-ref e8 --timeout 20 --json",
+    "hound element drag --session-name work --ref e7 --to-ref e8 --method mouse --steps 20 --json",
   ],
   async run(input, ctx) {
     const s: string = input["session-name"];
-    const r = await callSession(ctx, s, "drag", { ref: input.ref, toRef: input["to-ref"], ...dialogParams(input) });
+    const r = await callSession(ctx, s, "drag", { ref: input.ref, toRef: input["to-ref"], method: input.method, steps: input.steps, ...dialogParams(input) });
     return {
-      summary: `Dragged ${r.ref} onto ${r.toRef}; now at ${r.url}.${dialogNote(r)}`,
-      data: { ref: r.ref, toRef: r.toRef, url: r.url, title: r.title, tabs: r.tabs, ...dialogData(r) },
+      summary: `Dragged ${r.ref} onto ${r.toRef} (${r.method}${r.fellBack ? ", after drag-and-drop had no effect" : ""}); now at ${r.url}.${dialogNote(r)}`,
+      data: { ref: r.ref, toRef: r.toRef, method: r.method, ...(r.fellBack && { fellBack: true }), url: r.url, title: r.title, tabs: r.tabs, ...dialogData(r) },
       next_actions: afterAct(s),
     };
   },
 });
+
+function setChecked(verb: "check" | "uncheck") {
+  const on = verb === "check";
+  return defineCommand({
+    name: `element.${verb}`,
+    description: `${on ? "Check" : "Uncheck"} a checkbox, radio button or switch by ref (<input type=checkbox|radio>, or role checkbox, radio or switch with aria-checked). Idempotent: when it already is ${on ? "checked" : "unchecked"} nothing is clicked (data.changed false). ${on ? "" : "A radio button cannot be unchecked. "}Needs --actions interact (it changes form state).`,
+    kind: "write",
+    flags: { ...SESSION_FLAG, ref: { ...REF_FLAG, description: "Checkbox, radio or switch ref from the latest page snapshot, e.g. e12" }, ...DIALOG_FLAGS },
+    requiresWhen: DIALOG_RULES,
+    examples: [
+      `hound element ${verb} --session-name work --ref e12 --json`,
+      `hound element ${verb} --session-name work --ref e31 --timeout 20 --json`,
+      `hound element ${verb} --session-name work --ref e7 --dialog accept --json`,
+    ],
+    async run(input, ctx) {
+      const s: string = input["session-name"];
+      const r = await callSession(ctx, s, "check", { ref: input.ref, checked: on, ...dialogParams(input) });
+      return {
+        summary: `${r.changed ? `${r.checked ? "Checked" : "Unchecked"} ${r.ref}` : `${r.ref} was already ${r.checked ? "checked" : "unchecked"}; nothing changed`}.${dialogNote(r)}`,
+        data: { ref: r.ref, checked: r.checked, changed: r.changed, ...dialogData(r) },
+        next_actions: afterAct(s),
+      };
+    },
+  });
+}
+
+export const elementCheck = setChecked("check");
+export const elementUncheck = setChecked("uncheck");
 
 export const elementRead = defineCommand({
   name: "element.read",
@@ -271,7 +306,7 @@ export const elementType = defineCommand({
 export const elementDownload = defineCommand({
   name: "element.download",
   description:
-    "Click an element (usually a download link or button) and save the file it downloads; returns the path, never the contents. The read level only allows real http(s) links; buttons need --actions interact. Waits for the download up to --timeout (default 30 s).",
+    "Click an element (usually a download link or button) and save the file it downloads; returns the path, never the contents. The read level only allows real http(s) links that do not look like side-effect links (same rule as click); buttons need --actions interact. Waits for the download up to --timeout (default 30 s).",
   kind: "write",
   flags: {
     ...SESSION_FLAG,
@@ -381,4 +416,4 @@ export const elementPress = defineCommand({
   },
 });
 
-export const elementCommands = [elementClick, elementDrag, elementRead, elementHover, elementFill, elementType, elementSelect, elementPress, elementDownload, elementUpload];
+export const elementCommands = [elementClick, elementDrag, elementCheck, elementUncheck, elementRead, elementHover, elementFill, elementType, elementSelect, elementPress, elementDownload, elementUpload];

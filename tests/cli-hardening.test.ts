@@ -571,6 +571,6 @@ describe("help wording", () => {
     assert.match(click, /\/logout/);
     const open = (await env.raw(["browser", "open", "--help"])).stdout;
     assert.match(open, /real http\(s\) links and <summary>/);
-    assert.match(open, /not detected/);
+    assert.match(open, /look like GET side effects/);
   });
 });

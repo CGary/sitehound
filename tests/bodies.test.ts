@@ -1,7 +1,7 @@
 /** Unit tests for body redaction and filename sanitizing (no browser). */
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
-import { isBinaryType, isSecretKey, mediaType, numberedName, redactBody, sanitizeFilename } from "../packages/core/src/browserd/bodies.ts";
+import { isBinaryType, isSecretKey, maskPans, mediaType, numberedName, redactBody, sanitizeFilename } from "../packages/core/src/browserd/bodies.ts";
 import { MAX_OP_TIMEOUT_MS, REQUEST_BUFFER_CAP, TYPE_MAX_CHARS, typingFits, typingTimeoutMs } from "../packages/core/src/browserd/limits.ts";
 
 const body = (text: string, type: string) => redactBody(Buffer.from(text), type);
@@ -189,3 +189,87 @@ describe("redaction regressions (review findings)", () => {
     assert.ok(name.endsWith(".txt"));
   });
 });
+
+describe("maskPans (card numbers without false positives)", () => {
+  /** Luhn-valid digit strings of a given length starting with `prefix`, found by counting up. */
+  const luhnOk = (d: string): boolean => {
+    let sum = 0;
+    for (let i = d.length - 1, alt = false; i >= 0; i--, alt = !alt) {
+      let n = Number(d[i]);
+      if (alt && (n *= 2) > 9) n -= 9;
+      sum += n;
+    }
+    return sum % 10 === 0;
+  };
+  const valid = (prefix: string, length: number): string => {
+    for (let n = 0; ; n++) {
+      const d = prefix + String(n).padStart(length - prefix.length, "0");
+      if (luhnOk(d)) return d;
+    }
+  };
+
+  it("masks well-known test cards, plain and grouped", () => {
+    assert.equal(maskPans("pay 4242424242424242 now"), "pay [pan] now");
+    assert.equal(maskPans("pay 4242 4242 4242 4242 now"), "pay [pan] now");
+    assert.equal(maskPans("pay 4242-4242-4242-4242."), "pay [pan].");
+    assert.equal(maskPans("amex 378282246310005"), "amex [pan]");
+    assert.equal(maskPans("amex 3782 822463 10005"), "amex [pan]");
+    assert.equal(maskPans("mc 5555555555554444 / 2221000000000009 / 2720990000000007"), "mc [pan] / [pan] / [pan]");
+    assert.equal(maskPans("disc 6011111111111117 jcb 3530111333300000"), "disc [pan] jcb [pan]");
+    assert.equal(maskPans("visa 4 digit groups 4111 1111 1111 1111 111"), "visa 4 digit groups 4111 1111 1111 1111 111", "19 digits that fail Luhn stay");
+  });
+
+  it("keeps 13-digit epoch milliseconds, even when they pass Luhn", () => {
+    const epoch = valid("17", 13);
+    assert.equal(epoch.length, 13);
+    assert.equal(maskPans(`created ${epoch} ok`), `created ${epoch} ok`);
+    assert.equal(maskPans(`{"ts":${valid("16", 13)},"t2":${valid("1723", 13)}}`), `{"ts":${valid("16", 13)},"t2":${valid("1723", 13)}}`);
+  });
+
+  it("keeps other long Luhn-valid numbers with no card shape: ids, microsecond times, 19-digit snowflakes, 15 digits not starting 34/37", () => {
+    for (const n of [valid("1", 16), valid("17", 16), valid("1", 19), valid("9", 16), valid("123", 15), valid("4", 15), valid("9", 13), valid("8", 19), valid("7", 16), valid("3", 16), valid("34", 16), valid("6", 12), valid("0", 16)]) {
+      assert.equal(maskPans(`id ${n} end`), `id ${n} end`, n);
+    }
+  });
+
+  it("masks every brand by issuer prefix and length without any context: Visa 13/16/19, Mastercard (both ranges), Amex, Discover 6011/644-649/65, Diners 14, JCB, UnionPay 62, Maestro 50/56-69, Mir", () => {
+    const cases: Array<[string, string, number]> = [
+      ["Visa13", "4", 13], ["Visa16", "4", 16], ["Visa19", "4", 19], ["MC51", "51", 16], ["MC55", "55", 16], ["MC2221", "2221", 16], ["MC2720", "2720", 16], ["MC2500", "25", 16],
+      ["Amex34", "34", 15], ["Amex37", "37", 15], ["Disc6011", "6011", 16], ["Disc644", "644", 16], ["Disc649", "649", 19], ["Disc65", "65", 16],
+      ["Diners30", "300", 14], ["Diners36", "36", 14], ["Diners38", "38", 14], ["Diners39", "39", 14], ["JCB", "35", 16], ["JCB19", "35", 19],
+      ["UnionPay16", "62", 16], ["UnionPay19", "62", 19], ["Maestro50", "50", 16], ["Maestro56", "56", 13], ["Maestro67", "67", 19], ["Maestro60", "60", 18], ["Mir2200", "2200", 16], ["Mir2204", "2204", 19],
+    ];
+    for (const [name, prefix, length] of cases) {
+      const n = valid(prefix, length);
+      assert.equal(n.length, length, name);
+      assert.equal(maskPans(`n ${n} z`), "n [pan] z", `${name} ${n}`);
+    }
+    // Wrong length for the brand, or a non-brand prefix: kept.
+    for (const [prefix, length] of [["34", 16], ["51", 19], ["36", 16], ["2205", 16], ["2721", 16], ["8", 16], ["7", 15], ["12", 16], ["1", 13]] as const) {
+      const n = valid(prefix, length);
+      assert.equal(maskPans(`n ${n} z`), `n ${n} z`, `${prefix}/${length} ${n}`);
+    }
+  });
+
+  it("a card hint (the caller says so, or a card word right before) masks any Luhn-valid 13-19 digits", () => {
+    const n13 = valid("9", 13);
+    const n19 = valid("8", 19);
+    assert.equal(maskPans(`x ${n13} y`, true), "x [pan] y");
+    assert.equal(maskPans(`card number: ${n19}`), "card number: [pan]");
+    assert.equal(maskPans(`tarjeta ${n13}`), "tarjeta [pan]");
+    assert.equal(maskPans(`pan=${n13}`), "pan=[pan]");
+    assert.equal(maskPans(`order number: ${n13}`), `order number: ${n13}`, "'number' alone is not a card hint");
+    assert.equal(maskPans(`card\n${n13}`), `card\n${n13}`, "the hint must be on the same line");
+    assert.equal(maskPans("card 1234567890123", true), "card 1234567890123", "still needs Luhn");
+  });
+
+  it("works through bodies: a card parent key masks a bare 13-digit number, a timestamp in the same body stays", () => {
+    const epoch = valid("17", 13);
+    const card13 = valid("9", 13);
+    const r = redactBody(Buffer.from(JSON.stringify({ at: epoch, wallet: { card: { holder: `n ${card13}` } }, note: `ref ${epoch}` })), "application/json").text!;
+    assert.doesNotMatch(r, new RegExp(card13));
+    assert.equal(JSON.parse(r).at, epoch, "numbers stay numbers");
+    assert.match(r, new RegExp(`ref ${epoch}`));
+  });
+});
+

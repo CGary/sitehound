@@ -228,6 +228,7 @@ const PAGES: Record<string, string> = {
 <a href="/files/evil">Get evil</a>
 <a href="/files/leak">Get leak</a>
 <a href="/files/stuck">Get stuck</a>
+<a href="/files/hang">Get hang</a>
 <button id="b" onclick="location.href='/files/report.txt'">Export PDF</button>
 <button id="n" onclick="void 0">Do nothing</button>`,
   ),
@@ -389,6 +390,116 @@ const PAGES: Record<string, string> = {
 <label for="lab">Card number</label><input type="text" id="lab" value="4242424242424242">
 <input type="text" value="plain-value" aria-label="Plain field">`,
   ),
+  // Read-level links: which ones look like GET links with side effects (logout, delete, unsubscribe, action=remove ...) and which do not.
+  "/sidefx": page(
+    "Sidefx",
+    `<h1>Sidefx</h1>
+<ul>
+<li><a href="/logout">Leave</a></li>
+<li><a href="/account/delete">Account page</a></li>
+<li><a href="/items/42/Sign-Out">Go on</a></li>
+<li><a href="/items?action=remove&id=4">Item four</a></li>
+<li><a href="/neutral">Cerrar sesión</a></li>
+<li><a href="/neutral2" aria-label="Unsubscribe from emails">Click here</a></li>
+<li><a href="/deleted-items">Deleted items</a></li>
+<li><a href="/blog/how-to-remove-stains">Tips for stains</a></li>
+<li><a href="/docs?q=delete&removed=1">Search docs</a></li>
+<li><a href="/about">Learn about us</a></li>
+<li><a href="/files/report.txt">Delete log export</a></li>
+</ul>`,
+  ),
+  "/logout": page("Logged out", `<h1>Logged out</h1>`),
+  "/account/delete": page("Account deleted", `<h1>Account deleted</h1>`),
+  "/deleted-items": page("Deleted items", `<h1>Deleted items</h1>`),
+  "/neutral": page("Neutral", `<h1>Neutral</h1>`),
+  "/neutral2": page("Neutral two", `<h1>Neutral two</h1>`),
+  "/blog/how-to-remove-stains": page("Stains", `<h1>Stains</h1>`),
+  "/docs": page("Docs", `<h1>Docs</h1>`),
+  "/items": page("Items", `<h1>Items</h1>`),
+  "/items/42/Sign-Out": page("Signed out", `<h1>Signed out</h1>`),
+  // Text that looks like secret codes (one-time codes, PINs) next to ordinary numbers; PAN-like numbers and an epoch in milliseconds.
+  "/codes": page(
+    "Codes",
+    `<h1>Codes</h1>
+<p>Your verification code is 482913. It expires in 10 minutes.</p>
+<p>Total 4500 EUR, order 123456 on 2024-01-05 at 12:30</p>
+<div class="otp-box"><p>731904</p></div>
+<div aria-label="Security PIN"><p>8842</p></div>
+<p>Código de verificación</p>
+<p>907153</p>
+<p>Quantity 3456 shipped to zip code 28001</p>
+<p>Paid with card 4242 4242 4242 4242 at 1723456789011 ms</p>
+<p>Created 1700000000004</p>`,
+  ),
+  // Pointer-only drag: no HTML5 drag-and-drop. The chip is dropped only when the pointer moved at least 3 times while pressed.
+  // Review round 2 fixtures.
+  "/dollar": page("$$cost", `<h1>Dollar</h1><label>Amount <input type="text" id="amt" aria-label="Amount"></label>`),
+  // Rich-text editors holding text that must never become a locator, a comment or a parameter name.
+  "/editor": page(
+    "Editor",
+    `<h1>Editor</h1>
+<div id="ed" contenteditable="true" role="textbox">PREFILLED-SECRET-77</div>
+<div id="ed2" contenteditable="true">PREFILLED-SECRET-88</div>
+<div id="out" role="status">idle</div>`,
+  ),
+  "/longattrs": page("Longattrs", `<h1>Long</h1><button id="${"i".repeat(300)}" data-testid="${"t".repeat(300)}" aria-label="${"a".repeat(300)}">Go</button><div id="done" role="status">idle</div>`),
+  // Drag by mouse events only; the drop is applied 600 ms later (an animated library).
+  "/drag-slow": page(
+    "Drag slow",
+    `<h1>Drag slow</h1>
+<button id="chip">Chip</button> <button id="bin">Bin</button>
+<pre id="log" role="log"></pre>
+<script>
+  var pressed = false;
+  document.getElementById("chip").addEventListener("mousedown", function () { pressed = true; });
+  document.addEventListener("mouseup", function (e) {
+    if (!pressed) return;
+    pressed = false;
+    var el = document.elementFromPoint(e.clientX, e.clientY);
+    if (el && el.id === "bin") setTimeout(function () { document.getElementById("log").textContent += "moved;"; }, 600);
+  });
+</script>`,
+  ),
+  // Links that send a non-GET request through a data attribute or a method override.
+  "/sidefx2": page(
+    "Sidefx2",
+    `<h1>Sidefx2</h1>
+<a href="/neutral" data-method="delete">Open one</a>
+<a href="/neutral" data-turbo-method="post">Open two</a>
+<a href="/neutral?_method=delete">Open three</a>
+<a href="/neutral2" data-method="get">Open four</a>
+<a href="/neutral2">Open five</a>`,
+  ),
+  "/sw": page(
+    "Sw",
+    `<h1>Sw</h1><p id="out" role="status">pending</p>
+<script>
+  if (!navigator.serviceWorker) document.getElementById("out").textContent = "sw:none";
+  else navigator.serviceWorker.register("/sw.js").then(function () { return navigator.serviceWorker.getRegistrations(); }).then(
+    function (rs) { document.getElementById("out").textContent = "sw:registrations=" + rs.length; },
+    function () { document.getElementById("out").textContent = "sw:refused"; });
+</script>`,
+  ),
+  "/blank": page("Blank", `<h1>Blank</h1><a href="/about" target="_blank">Open elsewhere</a>`),
+  // Pressing Enter submits a form whose answer never comes.
+  "/hangform": page("Hangform", `<h1>Hangform</h1><form action="/files/hang" method="get"><input type="text" name="q" aria-label="Query"></form>`),
+  "/drag-pointer": page(
+    "Drag pointer",
+    `<h1>Drag pointer</h1>
+<button id="chip">Chip</button> <button id="bin">Bin</button>
+<pre id="log" role="log"></pre>
+<script>
+  var pressed = false, moves = 0;
+  document.getElementById("chip").addEventListener("mousedown", function () { pressed = true; moves = 0; });
+  document.addEventListener("mousemove", function () { if (pressed) moves++; });
+  document.addEventListener("mouseup", function (e) {
+    if (!pressed) return;
+    pressed = false;
+    var el = document.elementFromPoint(e.clientX, e.clientY);
+    if (moves >= 3 && el && el.id === "bin") document.getElementById("log").textContent += "dropped:" + moves + ";";
+  });
+</script>`,
+  ),
   // A request with a long path (for catastrophic-regex checks) and a plain /api/data one.
   "/redos": page(
     "Redos",
@@ -429,6 +540,108 @@ Promise.all(Array.from({ length: 520 }, function (_, i) { return fetch("/api/dat
   document.getElementById("done").textContent = "net done";
 })();
 </script>`,
+  ),
+  // --block: an image, a web font, an audio file and two tracker requests (the hosts are never reached when blocked).
+  "/blockme": page(
+    "Blockme",
+    `<style>@font-face { font-family: HoundTest; src: url(/assets/t.woff2) format("woff2"); } body { font-family: HoundTest, sans-serif; }</style>
+<h1>Blockme</h1><img id="pic" src="/assets/pic.png" alt="Logo" width="20" height="20"><audio src="/assets/a.mp3" preload="auto"></audio>
+<p id="out" role="status">pending</p>
+<script>
+  if (location.search.indexOf("trackers") >= 0) {
+    new Image().src = "http://www.google-analytics.com/g/collect?v=2";
+    new Image().src = "http://stats.g.doubleclick.net/pixel";
+  }
+  window.addEventListener("load", function () {
+    setTimeout(function () { document.getElementById("out").textContent = "pic:" + document.getElementById("pic").naturalWidth; }, 300);
+  });
+</script>`,
+  ),
+  // --locale / --timezone / --geolocation: what the page sees.
+  "/env": page(
+    "Env",
+    `<h1>Env</h1><p id="lang" role="status"></p><p id="tz" role="status"></p><p id="geo" role="status">geo pending</p>
+<script>
+  document.getElementById("lang").textContent = "lang:" + navigator.language + " num:" + (1234.5).toLocaleString();
+  document.getElementById("tz").textContent = "tz:" + Intl.DateTimeFormat().resolvedOptions().timeZone;
+  navigator.geolocation.getCurrentPosition(
+    function (p) { document.getElementById("geo").textContent = "geo:" + p.coords.latitude + "," + p.coords.longitude + "," + p.coords.accuracy; },
+    function (e) { document.getElementById("geo").textContent = "geo-error:" + e.code; },
+  );
+</script>`,
+  ),
+  // element check / uncheck: native checkbox (one pre-checked), radios, ARIA switch/checkbox, a confirm on change, a button.
+  "/checks": page(
+    "Checks",
+    `<h1>Checks</h1>
+<label><input type="checkbox" id="news" onchange="fetch('/api/data?news=1')"> Newsletter</label>
+<label><input type="checkbox" id="terms" checked> Terms</label>
+<label><input type="radio" name="size" id="small" value="s"> Small</label>
+<label><input type="radio" name="size" id="large" value="l" checked> Large</label>
+<div role="switch" id="dark" aria-checked="false" aria-label="Dark mode" tabindex="0" style="width:40px;height:20px;background:#ccc"></div>
+<div role="checkbox" id="agree" aria-checked="true" aria-label="Agree" tabindex="0" style="width:20px;height:20px;background:#9c9"></div>
+<label><input type="checkbox" id="del" onchange="out.textContent = confirm('Really?') ? 'confirmed' : 'declined'"> Delete all</label>
+<label><input type="checkbox" id="stuck" onclick="event.preventDefault()"> Stuck</label>
+<button id="btn">Plain button</button>
+<p id="out" role="status">idle</p>
+<script>
+  var out = document.getElementById("out");
+  ["dark", "agree"].forEach(function (id) {
+    var el = document.getElementById(id);
+    el.addEventListener("click", function () { el.setAttribute("aria-checked", el.getAttribute("aria-checked") === "true" ? "false" : "true"); });
+  });
+</script>`,
+  ),
+  // page pdf: enough text for several pages.
+  "/print": page(
+    "Print",
+    `<h1>Printable report</h1>${Array.from({ length: 160 }, (_, i) => `<p>Paragraph ${i + 1}: ${"lorem ipsum dolor sit amet ".repeat(8)}</p>`).join("")}`,
+    "<style>body { background: #eef; }</style>",
+  ),
+  // script export: a short form flow (fill, select, check, a button that reveals text, a link) and two "Add" buttons that
+  // no locator tells apart (same role, name and 6-level CSS path).
+  "/flow": page(
+    "Flow",
+    `<h1>Flow</h1>
+<label>Full name <input type="text" id="fullname"></label>
+<label>Secret code <input type="password" id="code"></label>
+<label>Plan <select id="plan"><option value="free">Free</option><option value="pro">Pro</option></select></label>
+<label><input type="checkbox" id="agree"> I agree</label>
+<button onclick="setTimeout(function () { var ok = document.getElementById('agree').checked && document.getElementById('plan').value === 'pro' && document.getElementById('fullname').value !== '' && document.getElementById('code').value !== ''; document.getElementById('msg').textContent = ok ? 'All set' : 'Missing data'; }, 300)">Continue</button>
+<div id="msg" role="status"></div>
+${'<section><div><div><div><div><div><button onclick="this.textContent = \'Added\'">Add</button></div></div></div></div></div></section>'.repeat(2)}
+<a href="/about">About page</a>`,
+  ),
+  // snapshot --ref / --diff: a stable nav and a main region that changes.
+  "/diffy": page(
+    "Diffy",
+    `<h1>Diffy</h1>
+<nav aria-label="Primary"><a href="/about">About page</a> <a href="/form">Form page</a></nav>
+<main aria-label="Work area">
+  <h2 id="title">Orders</h2>
+  <ul id="list"><li>Order one</li><li>Order two</li></ul>
+  <button onclick="var li = document.createElement('li'); li.textContent = 'Order ' + (document.querySelectorAll('li').length + 1); document.getElementById('list').appendChild(li)">Add order</button>
+  <button onclick="document.getElementById('title').textContent = 'Orders (renamed)'">Rename</button>
+  <button onclick="var l = document.getElementById('list'); l.removeChild(l.firstChild)">Drop first</button>
+</main>
+<footer><p>Footer text</p></footer>`,
+  ),
+  // Tabs: a target=_blank link (popup) and a plain link to compare against.
+  "/popups": page(
+    "Popups",
+    `<h1>Popups</h1><a href="/about" target="_blank">Open about in a new tab</a> <a href="/form">Same tab form</a>`,
+  ),
+  // task component: a card with a hover colour, a focus outline, an image and a responsive width.
+  "/comp": page(
+    "Comp",
+    `<h1>Comp page</h1><div class="card" id="card"><h2>Card title</h2><img src="/assets/pic.png" alt="Pic" width="20" height="20"><a href="/about" class="cta">Buy now</a></div>`,
+    `<style>
+.card { background: #fafafa; padding: 12px; width: 90%; max-width: 600px; border: 1px solid #ccc; }
+.cta { color: #036; display: inline-block; padding: 4px 8px; background: #eef; }
+.cta:hover { background: #fc0; color: #000; }
+.cta:focus { outline: 3px solid #f0f; }
+@media (min-width: 800px) { .card { padding: 32px; } }
+</style>`,
   ),
 };
 
@@ -482,11 +695,28 @@ export async function startFixture(): Promise<Fixture> {
       res.write(Buffer.alloc(200_000, 97));
       return;
     }
+    if (path === "/files/hang") {
+      // Accepts the request and never answers: the navigation the click starts stays pending.
+      return;
+    }
     const file = path === "/files/report.txt" || path === "/files/evil" || path === "/files/leak";
     if (file) {
       const name = path === "/files/evil" ? "../../evil.txt" : path === "/files/leak" ? "jane.doe@example.com-A1b2C3d4E5f6G7h8I9j0K1l2M3.txt" : "report.txt";
       res.writeHead(200, { "content-type": "text/plain", "content-disposition": `attachment; filename="${name}"` });
       res.end("hello report");
+      return;
+    }
+    if (path.startsWith("/assets/")) {
+      // 1x1 PNG, and opaque bytes for the font and the audio file: blocking is decided by the request, not the content.
+      const png = Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==", "base64");
+      const type = path.endsWith(".png") ? "image/png" : path.endsWith(".woff2") ? "font/woff2" : "audio/mpeg";
+      res.writeHead(200, { "content-type": type });
+      res.end(path.endsWith(".png") ? png : Buffer.alloc(64, 1));
+      return;
+    }
+    if (path === "/sw.js") {
+      res.writeHead(200, { "content-type": "application/javascript" });
+      res.end("self.addEventListener('fetch', function () {});");
       return;
     }
     const api = API[path];

@@ -17,6 +17,14 @@ export interface SessionOptions {
   deviceScaleFactor?: number;
   /** Mobile emulation: isMobile + hasTouch. */
   mobile?: boolean;
+  /** BCP 47 tag for navigator.language, Accept-Language and Intl. */
+  locale?: string;
+  /** IANA time zone name. */
+  timezoneId?: string;
+  /** Fixed position for navigator.geolocation; the geolocation permission is granted for the whole context. */
+  geolocation?: { latitude: number; longitude: number; accuracy?: number };
+  /** Service workers are not allowed: their requests bypass context routes (needed by `--block`). */
+  blockServiceWorkers?: boolean;
 }
 
 export interface Session {
@@ -37,7 +45,7 @@ export function missingBrowserError(): HoundError {
 
 export const defaultHeadless = (): boolean => process.env.HOUND_HEADLESS !== "false";
 
-export async function openSession({ profile, headless = defaultHeadless(), downloadsPath, viewport, deviceScaleFactor, mobile }: SessionOptions = {}): Promise<Session> {
+export async function openSession({ profile, headless = defaultHeadless(), downloadsPath, viewport, deviceScaleFactor, mobile, locale, timezoneId, geolocation, blockServiceWorkers }: SessionOptions = {}): Promise<Session> {
   if (profile && !hasProfile(profile)) {
     throw new HoundError("PROFILE_NOT_FOUND", `Profile "${profile}" not found.`, {
       field: "profile",
@@ -65,6 +73,10 @@ export async function openSession({ profile, headless = defaultHeadless(), downl
     ...(viewport ? { viewport } : {}),
     ...(deviceScaleFactor ? { deviceScaleFactor } : {}),
     ...(mobile ? { isMobile: true, hasTouch: true } : {}),
+    ...(locale ? { locale } : {}),
+    ...(timezoneId ? { timezoneId } : {}),
+    ...(geolocation ? { geolocation, permissions: ["geolocation"] } : {}),
+    ...(blockServiceWorkers ? { serviceWorkers: "block" as const } : {}),
   });
   return {
     browser,

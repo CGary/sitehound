@@ -1,10 +1,15 @@
 import { existsSync, statSync } from "node:fs";
-import { basename, extname } from "node:path";
+import { chmod, writeFile } from "node:fs/promises";
+import { basename, extname, join } from "node:path";
 import { pathToFileURL } from "node:url";
 import type { Task, TaskContext, TaskResult } from "@sitehound/core";
 import { HoundError } from "@sitehound/core/errors";
 import { defineCommand } from "../framework/types.ts";
+import { SESSION_FLAG, callSession, sessionCmd } from "./browser-shared.ts";
+import { OUTPUT_FLAGS, checkOutputPath } from "./output.ts";
 import { RUN_FLAGS, executeRun } from "./runner.ts";
+import { renderScript } from "./script-export.ts";
+import { NAME_RULE, givenInput, readFileAction } from "./shared.ts";
 
 type ScriptFn = (ctx: TaskContext) => Promise<TaskResult | void>;
 
@@ -44,4 +49,69 @@ export const scriptRun = defineCommand({
   },
 });
 
-export const scriptCommands = [scriptRun];
+export const scriptExport = defineCommand({
+  name: "script.export",
+  description:
+    "Turn what was done in a running browser session (navigate, click, fill, type, select, check, drag, upload, download, waits, tabs, resize, emulate) into a test script for script run. Elements get stable locators (test id, role + name, label, placeholder, text, CSS; TODO comments where ambiguous); typed values, prompt answers and upload paths are never recorded and become --arg parameters; URL paths and waited-for texts become checks. Export before closing the session: the action log lives in its memory (last 500 actions).",
+  kind: "write",
+  flags: {
+    ...SESSION_FLAG,
+    ...OUTPUT_FLAGS,
+    output: {
+      ...OUTPUT_FLAGS.output!,
+      pattern: "\\.ts$",
+      patternHint: "a .ts file (the export is TypeScript; script run loads it)",
+      description: "Write the script to this .ts file instead of the session's runs directory (relative paths resolve against the current directory; refuses directories and symlinks)",
+    },
+    name: { type: "string", ...NAME_RULE, description: "Test name inside the script and in result.json (default export-<session-name>)" },
+    "include-query": { type: "boolean", description: "Keep query strings and fragments in exported URLs (they can hold tokens or personal data). Default: origin + path, token-like path segments masked" },
+  },
+  examples: [
+    "hound script export --session-name shop --json",
+    "hound script export --session-name shop --output ./checkout.test.ts --name checkout --json",
+    "hound script export --session-name shop --output ./checkout.test.ts --if-exists overwrite --include-query --json",
+  ],
+  async run(input, ctx) {
+    const s: string = input["session-name"];
+    if (input.output) await checkOutputPath(this, givenInput(input, ctx), input.output, input["if-exists"]);
+    const log = await callSession(ctx, s, "actions", { includeQuery: input["include-query"] === true });
+    if (log.actions.length === 0) {
+      throw new HoundError("VALIDATION_FAILED", `Nothing to export: session "${s}" has no recorded actions yet (navigate, click, fill, wait, ... first).`, {
+        field: "session-name",
+        received: s,
+        retryable: true,
+        suggestedFix: sessionCmd("page", "navigate", s, "--url", "<url>"),
+      });
+    }
+    const { browserSessionRunsDir, ensurePrivateDir, writeOutputSafe } = await import("@sitehound/core");
+    const generatedAt = new Date().toISOString();
+    const file: string = input.output ?? join(await ensurePrivateDir(browserSessionRunsDir(s)), `export-${generatedAt.replace(/[:.]/g, "-")}.ts`);
+    const rendered = renderScript(log, { name: input.name ?? `export-${s}`.slice(0, 64), file, generatedAt });
+    if (input.output) await writeOutputSafe(file, rendered.code, input["if-exists"] === "overwrite");
+    else {
+      await writeFile(file, rendered.code, { mode: 0o600, flag: "wx" });
+      await chmod(file, 0o600);
+    }
+    const params = rendered.params.map((p) => p.name);
+    return {
+      summary: `Exported ${rendered.steps} step(s) to a script${params.length ? ` with ${params.length} required --arg value(s)` : ""}${rendered.ambiguous ? `; ${rendered.ambiguous} locator(s) need checking (TODO verify locator)` : ""}${log.dropped ? `; the first ${log.dropped} action(s) were no longer in the log` : ""}.`,
+      data: {
+        file,
+        steps: rendered.steps,
+        ambiguous: rendered.ambiguous,
+        params,
+        paramsInfo: rendered.params,
+        startUrl: rendered.startUrl,
+        ...(log.session.profile && { profile: log.session.profile }),
+        ...(log.dropped && { dropped: log.dropped }),
+      },
+      plain: file,
+      next_actions: [
+        { command: rendered.runCommand, reason: `Replay the export as a test${params.length ? " (replace each <name> with the value to type; never paste secrets into shared logs)" : ""}.` },
+        readFileAction(file, "Review the script (locators, TODO comments, checks)."),
+      ],
+    };
+  },
+});
+
+export const scriptCommands = [scriptRun, scriptExport];

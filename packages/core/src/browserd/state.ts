@@ -7,7 +7,7 @@ import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { HoundError } from "../errors.ts";
 import { RUNS_DIR, SESSIONS_DIR, assertSafeName } from "../paths.ts";
-import { DEVICE_SCALE_FACTOR_MAX, DEVICE_SCALE_FACTOR_MIN, VIEWPORT_MAX_HEIGHT, VIEWPORT_MAX_WIDTH, VIEWPORT_MIN_HEIGHT, VIEWPORT_MIN_WIDTH, viewportInBounds } from "./limits.ts";
+import { BLOCK_CATEGORIES, DEVICE_SCALE_FACTOR_MAX, DEVICE_SCALE_FACTOR_MIN, GEOLOCATION_RANGE, VIEWPORT_MAX_HEIGHT, VIEWPORT_MAX_WIDTH, VIEWPORT_MIN_HEIGHT, VIEWPORT_MIN_WIDTH, geolocationInBounds, isValidLocale, isValidTimezone, viewportInBounds } from "./limits.ts";
 import type { BrowserOp, DaemonState } from "./types.ts";
 
 /** The daemon's entry script; also how a pid is recognised as ours (via /proc/<pid>/cmdline). */
@@ -112,7 +112,7 @@ export async function removeSessionDir(dir: string): Promise<void> {
   await rm(dir, { recursive: true, force: true });
 }
 
-const STATE_CHANGING_OPS = new Set<BrowserOp>(["navigate", "click", "fill", "select", "press", "type", "download", "upload", "drag", "back", "forward", "reload"]);
+const STATE_CHANGING_OPS = new Set<BrowserOp>(["navigate", "click", "fill", "select", "press", "type", "download", "upload", "drag", "check", "back", "forward", "reload"]);
 
 /** Ops whose effect may have landed even if the caller saw a timeout (tabs: only new/close). */
 export function isStateChanging(op: BrowserOp, params: Record<string, unknown>): boolean {
@@ -152,6 +152,39 @@ export function assertDeviceScaleFactor(value: unknown): void {
       received: value,
       retryable: true,
     });
+  }
+}
+
+/** Throws unless `block` is a list of known categories (INVALID_ENUM, field "block"). */
+export function assertBlock(block: unknown): void {
+  const bad = !Array.isArray(block) ? block : block.find((c) => !(BLOCK_CATEGORIES as readonly unknown[]).includes(c));
+  if (bad !== undefined) {
+    throw new HoundError("INVALID_ENUM", `Invalid --block "${String(Array.isArray(block) ? bad : block).slice(0, 40)}".`, { field: "block", received: String(Array.isArray(block) ? bad : block).slice(0, 40), allowed: BLOCK_CATEGORIES });
+  }
+}
+
+/** Throws INVALID_ARGUMENT (field "locale") unless `locale` is a BCP 47 language tag. */
+export function assertLocale(locale: unknown): void {
+  if (!isValidLocale(locale)) {
+    throw new HoundError("INVALID_ARGUMENT", "--locale must be a BCP 47 language tag such as es-AR, en-US or pt-BR.", { field: "locale", received: String(locale).slice(0, 40), retryable: true });
+  }
+}
+
+/** Throws INVALID_ARGUMENT (field "timezone") unless `timezone` is an IANA time zone name. */
+export function assertTimezone(timezone: unknown): void {
+  if (!isValidTimezone(timezone)) {
+    throw new HoundError("INVALID_ARGUMENT", "--timezone must be an IANA time zone name such as America/Argentina/Buenos_Aires or Europe/Madrid.", {
+      field: "timezone",
+      received: String(timezone).slice(0, 64),
+      retryable: true,
+    });
+  }
+}
+
+/** Throws INVALID_ARGUMENT (field "geolocation") unless the position is within bounds. */
+export function assertGeolocation(geolocation: unknown): void {
+  if (!geolocationInBounds(geolocation)) {
+    throw new HoundError("INVALID_ARGUMENT", `--geolocation must be LAT,LON[,ACCURACY] with ${GEOLOCATION_RANGE}.`, { field: "geolocation", retryable: true });
   }
 }
 

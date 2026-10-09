@@ -7,16 +7,16 @@
  * Logging rule: daemon.log gets op names, durations and error codes only. Never URLs, page text,
  * console text, cookies or headers.
  */
-import { constants as fsConstants } from "node:fs";
-import { chmod, copyFile, link, rename, rm, stat, writeFile } from "node:fs/promises";
+import { chmod, link, rename, rm, stat, writeFile } from "node:fs/promises";
 import { createServer, type Socket } from "node:net";
-import { dirname, join } from "node:path";
-import type { BrowserContext, Dialog, Download, FileChooser, Locator, Page, Request } from "playwright";
+import { join } from "node:path";
+import type { BrowserContext, CDPSession, Dialog, Download, FileChooser, Locator, Page, Request } from "playwright";
 import { isMissingBrowser, missingBrowserError, openSession, type Session } from "../browser.ts";
 import { HoundError, isHoundError } from "../errors.ts";
 import { ensurePrivateDir } from "../paths.ts";
 import { redactText, stripUrl } from "../redact.ts";
 import { cleanTrace } from "../trace.ts";
+import { blockedCategory } from "./block.ts";
 import { DOWNLOAD_FALLBACK_NAME, isBinaryType, mediaType, numberedName, redactBody, sanitizeFilename } from "./bodies.ts";
 import {
   CONFIG_FILE,
@@ -58,6 +58,11 @@ import {
   DIALOG_BUFFER_CAP,
   DIALOG_GRACE_MS,
   DIALOG_TEXT_MAX_CHARS,
+  DRAG_METHODS,
+  DRAG_SETTLE_MS,
+  DRAG_STEPS_DEFAULT,
+  DRAG_STEPS_MAX,
+  DRAG_STEPS_MIN,
   FIND_CONTEXT_MAX,
   FIND_LIMIT_DEFAULT,
   FIND_LIMIT_MAX,
@@ -65,18 +70,27 @@ import {
   FIND_REGEX_BUDGET_MS,
   FIND_SNAPSHOT_MAX_CHARS,
   MAX_OP_TIMEOUT_MS,
+  PDF_FORMATS,
   READ_LIMIT_DEFAULT,
   READ_LIMIT_MAX,
   READ_SCAN_MAX_CHARS,
+  RECORD_DESCRIBE_MS,
   REQUEST_BUFFER_CAP,
+  SNAPSHOT_BASELINES_PER_TAB,
+  SNAPSHOT_BASELINE_MAX_CHARS,
+  SNAPSHOT_DIFF_CONTEXT,
   TYPE_MAX_CHARS,
   UPLOAD_MAX_FILES,
   typingFits,
   typingTimeoutMs,
+  type BlockCategory,
 } from "./limits.ts";
 import { matchRegex, matchSubstring, matchText, parseRegexArg, parseRequestValue } from "./find.ts";
-import { PASSWORD_SAFE_ATTRS, SENSITIVE_HINT, passwordBlocked, redactAttr, sanitizeSnapshot, type ReadFacts } from "./read.ts";
-import { scrubTokens } from "../redact.ts";
+import { PASSWORD_SAFE_ATTRS, SENSITIVE_HINT, passwordBlocked, redactAttr, redactFindLines, redactReadText, sanitizeSnapshot, type ReadFacts } from "./read.ts";
+import { outputError, placeFile, writeOutputSafe } from "./output.ts";
+import { sideEffectLinkReason } from "./sideeffect.ts";
+import { ActionLog, describeTarget, isRecorded, type OpNotes } from "./recorder.ts";
+import { diffSnapshots, snapshotSubtree } from "./snapdiff.ts";
 import { resolveUploadFiles } from "./upload.ts";
 
 const ACTION_TIMEOUT_MS = 10_000;
@@ -96,7 +110,7 @@ type Params = Record<string, unknown>;
 
 const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
 /** Ops that accept a per-op dialog policy (`dialog`, `dialogText`): they can trigger alert/confirm/prompt/beforeunload. */
-const DIALOG_OPS: ReadonlySet<BrowserOp> = new Set<BrowserOp>(["click", "press", "select", "type", "download", "upload", "drag", "navigate", "back", "forward", "reload"]);
+const DIALOG_OPS: ReadonlySet<BrowserOp> = new Set<BrowserOp>(["click", "press", "select", "type", "download", "upload", "drag", "check", "navigate", "back", "forward", "reload"]);
 const log = (msg: string) => process.stderr.write(`${new Date().toISOString()} ${msg}\n`);
 const now = () => new Date().toISOString();
 let fileSeq = 0;
@@ -165,7 +179,7 @@ const OP_DEFAULT_TIMEOUT: Partial<Record<BrowserOp, number>> = {
   back: NAV_TIMEOUT_MS, forward: NAV_TIMEOUT_MS, reload: NAV_TIMEOUT_MS, tabs: NAV_TIMEOUT_MS,
   click: ACTION_TIMEOUT_MS, hover: ACTION_TIMEOUT_MS, fill: ACTION_TIMEOUT_MS, select: ACTION_TIMEOUT_MS, press: ACTION_TIMEOUT_MS,
   type: ACTION_TIMEOUT_MS, upload: ACTION_TIMEOUT_MS, download: DOWNLOAD_TIMEOUT_MS, request: NAV_TIMEOUT_MS,
-  drag: ACTION_TIMEOUT_MS, find: NAV_TIMEOUT_MS, read: ACTION_TIMEOUT_MS,
+  drag: ACTION_TIMEOUT_MS, find: NAV_TIMEOUT_MS, read: ACTION_TIMEOUT_MS, check: ACTION_TIMEOUT_MS, pdf: NAV_TIMEOUT_MS,
 };
 
 /**
@@ -184,7 +198,7 @@ function timeoutError(op: BrowserOp, p: Params, snapshotCmd?: string): HoundErro
     const url = stripUrl(p.url);
     what = `"${url}" to load`;
     [field, received] = ["url", url];
-  } else if (ref && ["click", "hover", "fill", "select", "press", "type", "upload", "download", "drag", "read"].includes(op)) {
+  } else if (ref && ["click", "hover", "fill", "select", "press", "type", "upload", "download", "drag", "read", "check"].includes(op)) {
     what = `element "${ref}" to be actionable for ${op}`;
     [field, received] = ["ref", ref];
   } else if (op === "press" && str("key")) {
@@ -229,37 +243,57 @@ function checkNavUrl(url: string): void {
 }
 
 /**
- * Read-level click policy, decided in the page (serialized: no outside references). Returns null when
- * allowed, else a short reason.
+ * Read-level click policy, step 1: decided in the page (serialized: no outside references). `block` is null when the element
+ * may be clicked, else a short reason. For an allowed link it also returns the resolved URL and the link's accessible texts,
+ * which `clickBlockReason` checks for side effects (step 2, outside the page).
  *
  * Allowed, and nothing else: (a) an `<a>` with an href whose resolved protocol (`new URL(el.href)`,
  * which also sees through `java\tscript:` tricks) is http: or https: and that is not a same-document
  * fragment link (`#...`, or the current URL with only the hash changed); (b) `<summary>`. Anything
  * inside a form or a button is blocked, as are role=link/tab/menuitem non-anchors, buttons and form controls.
- *
- * Remaining limits (by design, documented): a GET link with side effects (e.g. /logout) and a JS click
- * handler attached to a real link cannot be detected; elements in shadow DOM are checked against their
- * light-DOM ancestors only. `read` reduces accidental writes; it is not a sandbox.
  */
-function clickBlockReason(el: Element): string | null {
+function clickProbe(el: Element): { block: string | null; href?: string; labels?: string[] } {
   const only = "only http(s) links and <summary> can be clicked with --actions read";
-  if (el.closest("form")) return "the element is inside a form";
-  if (el.closest("button, [role=button]")) return "the element is a button or inside one";
+  if (el.closest("form")) return { block: "the element is inside a form" };
+  if (el.closest("button, [role=button]")) return { block: "the element is a button or inside one" };
   const tag = el.tagName.toLowerCase();
-  if (tag === "summary") return null;
-  if (!(el instanceof HTMLAnchorElement) || !el.hasAttribute("href")) return `the element is a <${tag}>; ${only}`;
+  if (tag === "summary") return { block: null };
+  if (!(el instanceof HTMLAnchorElement) || !el.hasAttribute("href")) return { block: `the element is a <${tag}>; ${only}` };
   const raw = (el.getAttribute("href") ?? "").trim();
   let url: URL;
   try {
     url = new URL(el.href);
   } catch {
-    return "the link's URL is not valid";
+    return { block: "the link's URL is not valid" };
   }
-  if (url.protocol !== "http:" && url.protocol !== "https:") return `the link uses ${url.protocol} instead of http(s)`;
-  if (raw.startsWith("#")) return "the link only jumps within the page";
+  if (url.protocol !== "http:" && url.protocol !== "https:") return { block: `the link uses ${url.protocol} instead of http(s)` };
+  if (raw.startsWith("#")) return { block: "the link only jumps within the page" };
   const here = new URL(location.href);
-  if (url.hash !== "" && url.href.split("#")[0] === here.href.split("#")[0]) return "the link only jumps within the page";
-  return null;
+  if (url.hash !== "" && url.href.split("#")[0] === here.href.split("#")[0]) return { block: "the link only jumps within the page" };
+  // Rails UJS / Turbo / Laravel links that send a non-GET request: <a data-method="delete" href="/posts/1">.
+  const verb = ["data-method", "data-turbo-method", "data-http-method"].map((a) => (el.getAttribute(a) ?? "").trim().toLowerCase()).find((v) => v !== "");
+  if (verb !== undefined && verb !== "get") {
+    return { block: "the link looks like a side-effect link (it sends a non-GET request through data-method): following it could change data, so it needs --actions interact" };
+  }
+  const labels = [el.getAttribute("aria-label"), el.getAttribute("title"), el.innerText, el.querySelector("img[alt]")?.getAttribute("alt")]
+    .filter((t): t is string => typeof t === "string" && t.trim() !== "")
+    .map((t) => t.slice(0, 200));
+  return { block: null, href: url.href, labels };
+}
+
+/**
+ * Read-level click policy for `click` and `download`: null when allowed, else a short reason. Step 1 (`clickProbe`, in the
+ * page) lets through only http(s) links and `<summary>`; step 2 (`sideEffectLinkReason`) refuses links whose URL path, query
+ * or label looks like logout/delete/unsubscribe/... (a GET with side effects).
+ *
+ * Remaining limits (by design, documented): a side-effect link with an innocent URL and label, a redirect, and a JS click
+ * handler attached to a real link cannot be detected; elements in shadow DOM are checked against their light-DOM ancestors
+ * only. `read` reduces accidental writes; it is not a sandbox.
+ */
+async function clickBlockReason(loc: Locator): Promise<string | null> {
+  const probe = await loc.evaluate(clickProbe);
+  if (probe.block) return probe.block;
+  return probe.href ? sideEffectLinkReason(probe.href, probe.labels ?? []) : null;
 }
 
 /** Set once the browser is up / once the daemon is serving; used by failDaemon. */
@@ -307,6 +341,11 @@ export async function runDaemon(dir: string): Promise<void> {
       ...(config.viewport ? { viewport: config.viewport } : {}),
       ...(config.deviceScaleFactor ? { deviceScaleFactor: config.deviceScaleFactor } : {}),
       ...(config.mobile ? { mobile: true } : {}),
+      ...(config.locale ? { locale: config.locale } : {}),
+      ...(config.timezone ? { timezoneId: config.timezone } : {}),
+      ...(config.geolocation ? { geolocation: config.geolocation } : {}),
+      // A service worker's own requests bypass context routes, so --block could not see them.
+      ...(config.block?.length ? { blockServiceWorkers: true } : {}),
     });
   } catch (err) {
     const msg = firstLine(err);
@@ -341,6 +380,18 @@ export async function runDaemon(dir: string): Promise<void> {
     if (requestBuffer.size > REQUEST_BUFFER_CAP) requestBuffer.delete(requestBuffer.keys().next().value as number);
     return index;
   };
+  // ---- --block: refused requests (a context-level route exists only when something is blocked) ----
+  const blockList: readonly BlockCategory[] = config.block ?? [];
+  const blockedRequests = new WeakMap<Request, BlockCategory>();
+  if (blockList.length > 0) {
+    await context.route("**/*", (route) => {
+      const req = route.request();
+      const category = blockedCategory(req.url(), req.resourceType(), blockList);
+      if (!category) return route.fallback().catch(() => {});
+      blockedRequests.set(req, category);
+      return route.abort("blockedbyclient").catch(() => {});
+    });
+  }
   // ---- JavaScript dialogs: one context-level handler covers every tab (popups included), so none can ever hang a page ----
   const dialogDefault: DialogAction = config.dialog === "accept" && config.actions === "interact" ? "accept" : "dismiss";
   const dialogRing: DialogEntry[] = [];
@@ -377,15 +428,18 @@ export async function runDaemon(dir: string): Promise<void> {
   });
   context.on("weberror", (e) => push(consoleRing, { time: now(), level: "error", source: "pageerror", text: redactText(firstLine(e.error()), 300) }, CONSOLE_CAP));
   context.on("requestfailed", (r) => {
+    const category = blockedRequests.get(r);
     const entry: NetworkEntry = {
       index: remember(r),
       time: now(),
       method: r.method(),
       url: cleanUrl(r.url()),
       resourceType: r.resourceType(),
-      failure: redactText(r.failure()?.errorText ?? "failed", 100),
+      failure: category ? "blocked" : redactText(r.failure()?.errorText ?? "failed", 100),
+      ...(category ? { blocked: category } : {}),
     };
-    push(failedRing, entry, NETWORK_FAILED_CAP);
+    // A request refused on purpose by --block is not a failure of the page: it is listed with `state all` only.
+    if (!category) push(failedRing, entry, NETWORK_FAILED_CAP);
     push(allRing, entry, NETWORK_ALL_CAP);
   });
   context.on("response", (r) => {
@@ -456,6 +510,10 @@ export async function runDaemon(dir: string): Promise<void> {
       ...(viewport ? { viewport } : {}),
       ...(config.deviceScaleFactor ? { deviceScaleFactor: config.deviceScaleFactor } : {}),
       ...(config.mobile ? { mobile: true } : {}),
+      ...(blockList.length ? { block: [...blockList] } : {}),
+      ...(config.locale ? { locale: config.locale } : {}),
+      ...(config.timezone ? { timezone: config.timezone } : {}),
+      ...(config.geolocation ? { geolocation: config.geolocation } : {}),
       ...(p ? { currentUrl: cleanUrl(p.url()) } : {}),
       tabs: context.pages().length,
     };
@@ -499,6 +557,22 @@ export async function runDaemon(dir: string): Promise<void> {
     });
   }
 
+  // ---- action log for `script export` (memory only; never values, answers or paths) ----
+  const actionLog = new ActionLog();
+  /** Set only while a recorded op runs: what it learned about its elements before acting. */
+  let opNotes: OpNotes | undefined;
+  /** The running op types into, checks or selects its element: the element's text is then never used to describe it (see recorder.ts). */
+  let opIsForm = false;
+  /**
+   * Describes the element behind `ref` for the action log, before the op acts on it (its ref may not survive the action).
+   * Bounded (RECORD_DESCRIBE_MS, and a quarter of what is left of the op's time); never throws, never fails the op.
+   */
+  async function note(key: "target" | "to" | "within", pg: Page, loc: Locator, ref: string): Promise<void> {
+    if (!opNotes) return;
+    const notes = opNotes;
+    notes[key] = await describeTarget(pg, loc, ref, Math.min(RECORD_DESCRIBE_MS, remainingMs() / 4), opIsForm).catch(() => ({ kind: "none" as const, ambiguous: true, hint: `element ${ref}` }));
+  }
+
   /** `--output`, validated up front: a path that is an existing directory is the caller's mistake. */
   async function outputPath(p: Params): Promise<string | undefined> {
     const output = optStr(p, "output", "output");
@@ -509,16 +583,8 @@ export async function runDaemon(dir: string): Promise<void> {
     return output;
   }
 
-  /** The HoundError for a failed write to a caller-chosen --output (or the original error when it is something else). */
-  function outputError(err: unknown, file: string): unknown {
-    const code = (err as NodeJS.ErrnoException).code;
-    if (code === "EISDIR") return new HoundError("INVALID_ARGUMENT", `--output must be a file path, but it is a directory: ${file}`, { field: "output", received: file });
-    if (code === "ENOENT" || code === "ENOTDIR") {
-      return new HoundError("FILE_NOT_FOUND", `The directory for --output does not exist: ${dirname(file)}`, { field: "output", received: file });
-    }
-    if (code === "EACCES" || code === "EPERM") return new HoundError("PERMISSION_DENIED", `Cannot write --output: ${file}`, { field: "output", received: file });
-    return err;
-  }
+  /** `--if-exists overwrite` (anything else, or nothing, means the exclusive default). */
+  const overwriteFlag = (p: Params): boolean => optEnum(p, "ifExists", "if-exists", ["error", "overwrite"] as const) === "overwrite";
 
   async function writeOutput(file: string, data: string | Buffer): Promise<void> {
     try {
@@ -528,6 +594,9 @@ export async function runDaemon(dir: string): Promise<void> {
       throw outputError(err, file);
     }
   }
+
+  /** Last snapshot text per tab for `snapshot --diff`, by "ref|depth"; at most SNAPSHOT_BASELINES_PER_TAB each, dropped with the tab. */
+  const baselines = new WeakMap<Page, Map<string, string>>();
 
   const snapshotCmd = `hound page snapshot --session-name ${name} --json`;
 
@@ -542,6 +611,24 @@ export async function runDaemon(dir: string): Promise<void> {
       return await Promise.race([work, late]);
     } finally {
       clearTimeout(timer);
+    }
+  }
+
+  /**
+   * A click or download that timed out may have left a navigation pending (the server accepted the request and never answered):
+   * Chromium then keeps the page busy and every later op (snapshot, hover, even navigate) times out behind it. Cancel the pending
+   * load (CDP Page.stopLoading, bounded) so the page is usable again; the document that was showing stays. Never throws.
+   */
+  async function releasePage(pg: Page): Promise<void> {
+    let cdp: CDPSession | undefined;
+    const slow = () => new HoundError("TIMEOUT", "Could not cancel the pending navigation.");
+    try {
+      cdp = await within(context.newCDPSession(pg), 1000, slow);
+      await within(cdp.send("Page.stopLoading"), 1000, slow);
+    } catch {
+      // best effort: the op already failed with its own TIMEOUT
+    } finally {
+      void cdp?.detach().catch(() => {});
     }
   }
 
@@ -581,57 +668,6 @@ export async function runDaemon(dir: string): Promise<void> {
     }
     pg.on("filechooser", onChooser);
     return { promise, cancel: () => done(null) };
-  }
-
-  const exists = (output: string) =>
-    new HoundError("CONFLICT", `--output already exists: ${output}. Pass --if-exists overwrite to replace it, or choose another path.`, { field: "output", received: output, retryable: false });
-
-  /**
-   * Publishes `from` (a private 0600 file in the same directory as `output`, or on the same file system) as `output` without
-   * ever following a symlink at the destination: rename replaces whatever is there (the link itself, not its target) and
-   * link() fails with EEXIST instead of overwriting. A file or symlink that appeared after the client's check is therefore
-   * respected: --if-exists error never overwrites, --if-exists overwrite never writes through a link.
-   */
-  async function publish(from: string, output: string, overwrite: boolean): Promise<void> {
-    if (overwrite) await rename(from, output);
-    else await link(from, output);
-  }
-
-  /** Moves a staged private file to the caller's --output (see publish); copies via a private temp file in the destination dir across file systems. */
-  async function placeFile(staged: string, output: string, overwrite: boolean): Promise<string> {
-    let temp: string | undefined;
-    try {
-      try {
-        await publish(staged, output, overwrite);
-      } catch (err) {
-        const code = (err as NodeJS.ErrnoException).code;
-        if (code !== "EXDEV" && code !== "EPERM" && code !== "ENOTSUP" && code !== "EMLINK") throw err;
-        temp = join(dirname(output), `.hound-partial-${stamp()}`);
-        await copyFile(staged, temp, fsConstants.COPYFILE_EXCL);
-        await chmod(temp, 0o600);
-        await publish(temp, output, overwrite);
-      }
-    } catch (err) {
-      if ((err as NodeJS.ErrnoException).code === "EEXIST") throw exists(output);
-      throw outputError(err, output);
-    } finally {
-      if (temp) await rm(temp, { force: true }).catch(() => {});
-    }
-    return output;
-  }
-
-  /** Writes text to the caller's --output through a private temp file in the same directory (see publish). */
-  async function writeOutputSafe(file: string, data: string, overwrite: boolean): Promise<void> {
-    const temp = join(dirname(file), `.hound-partial-${stamp()}`);
-    try {
-      await writeFile(temp, data, { mode: 0o600, flag: "wx" });
-      await publish(temp, file, overwrite);
-    } catch (err) {
-      if ((err as NodeJS.ErrnoException).code === "EEXIST") throw exists(file);
-      throw outputError(err, file);
-    } finally {
-      await rm(temp, { force: true }).catch(() => {});
-    }
   }
 
   /** Hard-links a staged file into `dir` under `name`, adding -2, -3, ... instead of ever replacing a file. */
@@ -674,6 +710,83 @@ export async function runDaemon(dir: string): Promise<void> {
     return { action: dialog ?? dialogDefault, ...(text !== undefined ? { text } : {}), explicit: dialog !== undefined || text !== undefined };
   }
 
+  /** Page signature for "did the drag do anything": URL, document size and hash, plus how many requests finished. */
+  const pageSignature = (pg: Page): Promise<string> =>
+    pg
+      .evaluate(() => {
+        const html = document.documentElement.outerHTML;
+        let h = 5381;
+        for (let i = 0; i < html.length; i++) h = ((h << 5) + h + html.charCodeAt(i)) | 0;
+        return `${window.location.href}|${html.length}|${h}`;
+      })
+      .catch(() => "gone")
+      .then((sig) => `${sig}|${requestSeq}`);
+
+  /** Where the dragged element is: position, size and its place in the tree. Animated libraries move it a little later than dragTo returns. */
+  const elementPlace = (loc: Locator): Promise<string> =>
+    loc
+      .evaluate((el) => {
+        const r = el.getBoundingClientRect();
+        const path: string[] = [];
+        for (let e: Element | null = el, i = 0; e && i < 5; e = e.parentElement, i++) {
+          path.push(`${e.tagName}${e.parentElement ? Array.prototype.indexOf.call(e.parentElement.children, e) : ""}`);
+        }
+        return `${Math.round(r.x)},${Math.round(r.y)},${Math.round(r.width)},${Math.round(r.height)}|${path.join("/")}`;
+      }, undefined, { timeout: 500 })
+      .catch(() => "gone");
+
+  /**
+   * Starts watching a drag: `changed()` is true when the page fired an HTML5 dragstart, or its URL/DOM/requests or the dragged element's
+   * position/parent differ from now. It polls up to DRAG_SETTLE_MS, because animated libraries only react after a transition.
+   */
+  async function watchDrag(pg: Page, source: Locator): Promise<{ changed(): Promise<boolean> }> {
+    const key = `__houndDrag${Math.random().toString(36).slice(2)}`;
+    const before = await pageSignature(pg);
+    const placeBefore = await elementPlace(source);
+    await pg.evaluate((k) => {
+      (window as unknown as Record<string, unknown>)[k] = false;
+      document.addEventListener("dragstart", () => ((window as unknown as Record<string, unknown>)[k] = true), { capture: true, once: true });
+    }, key).catch(() => {});
+    return {
+      async changed() {
+        const until = Date.now() + DRAG_SETTLE_MS;
+        let result = false;
+        for (;;) {
+          await sleep(capWait(100));
+          const started = await pg.evaluate((k) => (window as unknown as Record<string, unknown>)[k] === true, key).catch(() => false);
+          if (started || (await pageSignature(pg)) !== before || (await elementPlace(source)) !== placeBefore) {
+            result = true;
+            break;
+          }
+          if (Date.now() >= until || remainingMs() < 400) break;
+        }
+        await pg.evaluate((k) => { delete (window as unknown as Record<string, unknown>)[k]; }, key).catch(() => {});
+        return result;
+      },
+    };
+  }
+
+  /** A real pointer drag: move to the source centre, press, move to the target centre in `steps` moves, release. */
+  async function mouseDrag(pg: Page, source: Locator, target: Locator, steps: number, timeout: number): Promise<void> {
+    const centre = async (loc: Locator, what: string) => {
+      await loc.scrollIntoViewIfNeeded({ timeout });
+      const box = await loc.boundingBox();
+      if (!box || box.width <= 0 || box.height <= 0) {
+        throw new HoundError("INVALID_ARGUMENT", `The ${what} element is not visible, so it cannot be dragged with the pointer.`, { field: what === "source" ? "ref" : "to-ref", retryable: true });
+      }
+      return { x: box.x + box.width / 2, y: box.y + box.height / 2 };
+    };
+    const from = await centre(source, "source");
+    await pg.mouse.move(from.x, from.y);
+    await pg.mouse.down();
+    try {
+      const to = await centre(target, "target");
+      await pg.mouse.move(to.x, to.y, { steps });
+    } finally {
+      await pg.mouse.up();
+    }
+  }
+
   const ops: { [K in BrowserOp]: (p: Params) => Promise<BrowserOpResult<K>> } = {
     ping: async () => ({ pong: true, pid: process.pid, name }),
     status: info,
@@ -706,29 +819,64 @@ export async function runDaemon(dir: string): Promise<void> {
     async snapshot(p) {
       const depth = optInt(p, "depth", "depth", 0, 1000);
       const limit = optInt(p, "limitChars", "limit-chars", 1, 200_000) ?? 8000;
+      const ref = optStr(p, "ref", "ref");
+      const diff = p.diff === true;
       const output = await outputPath(p);
+      const overwrite = overwriteFlag(p);
       const pg = await page();
-      const full = sanitizeSnapshot(await pg.ariaSnapshot({ mode: "ai", ...(depth !== undefined ? { depth } : {}), timeout: timeoutOf(p, NAV_TIMEOUT_MS) }));
-      const truncated = full.length > limit;
-      let text = full;
+      const plain = { mode: "ai", timeout: timeoutOf(p, NAV_TIMEOUT_MS) } as const;
+      const options = { ...plain, ...(depth !== undefined ? { depth } : {}) } as const;
+      // With a ref only that element's subtree is returned. It is cut from a full snapshot (element.ariaSnapshot() would replace
+      // Playwright's ref map with the subtree's refs and break every ref outside it); the refs are the same a full snapshot gives.
+      let full: string;
+      if (ref) {
+        const whole = sanitizeSnapshot(await pg.ariaSnapshot(plain));
+        const sub = snapshotSubtree(whole, ref, depth);
+        // A ref the full snapshot does not list (e.g. inside a shadow root) falls back to the element's own snapshot.
+        full = sub ?? sanitizeSnapshot(await (await locate(pg, ref)).ariaSnapshot(options));
+      } else full = sanitizeSnapshot(await pg.ariaSnapshot(options));
+      const refs = full.match(/\[ref=[^\]\s]+\]/g)?.length ?? 0;
+      // The baseline of --diff: the last snapshot of this tab with the same ref and depth. Every snapshot replaces it.
+      const key = `${ref ?? ""}|${depth ?? 0}`;
+      const kept = baselines.get(pg) ?? new Map<string, string>();
+      baselines.set(pg, kept);
+      const previous = kept.get(key);
+      kept.delete(key);
+      if (full.length <= SNAPSHOT_BASELINE_MAX_CHARS) kept.set(key, full);
+      while (kept.size > SNAPSHOT_BASELINES_PER_TAB) kept.delete(kept.keys().next().value as string);
+      let body = full;
+      let change: { added: number; removed: number; baseline: boolean } | undefined;
+      if (diff) {
+        if (previous === undefined) change = { added: full.split("\n").length, removed: 0, baseline: false };
+        else {
+          const d = diffSnapshots(previous, full, SNAPSHOT_DIFF_CONTEXT);
+          body = d.text;
+          change = { added: d.added, removed: d.removed, baseline: true };
+        }
+      }
+      const truncated = body.length > limit;
+      let text = body;
       if (truncated) {
-        text = full.slice(0, limit);
+        text = body.slice(0, limit);
         const nl = text.lastIndexOf("\n");
         if (nl > limit / 2) text = text.slice(0, nl);
       }
       let file: string | undefined;
-      if (truncated || output) {
-        file = output ?? join(await runsDir(), `snapshot-${stamp()}.yml`);
-        await writeOutput(file, full);
+      if (output) {
+        file = output;
+        await writeOutputSafe(output, body, overwrite);
+      } else if (truncated) {
+        file = join(await runsDir(), `${change?.baseline ? "snapshot-diff" : "snapshot"}-${stamp()}.${change?.baseline ? "diff" : "yml"}`);
+        await writeOutput(file, body);
       }
-      const refs = full.match(/\[ref=[^\]\s]+\]/g)?.length ?? 0;
-      return { ...(await location(pg)), snapshot: text, truncated, totalChars: full.length, refs, ...(file ? { file } : {}) };
+      return { ...(await location(pg)), snapshot: text, truncated, totalChars: body.length, refs, ...(file ? { file } : {}), ...(change ? { diff: change } : {}) };
     },
 
     async screenshot(p) {
       const scope = optEnum(p, "scope", "scope", ["viewport", "full", "element"] as const) ?? "viewport";
       const ref = optStr(p, "ref", "ref");
       const output = await outputPath(p);
+      const overwrite = overwriteFlag(p);
       const timeout = timeoutOf(p, NAV_TIMEOUT_MS);
       const pg = await page();
       let buf: Buffer;
@@ -739,7 +887,8 @@ export async function runDaemon(dir: string): Promise<void> {
         buf = await pg.screenshot({ fullPage: scope === "full", timeout });
       }
       const file = output ?? join(await runsDir(), `screenshot-${stamp()}.png`);
-      await writeOutput(file, buf);
+      if (output) await writeOutputSafe(output, buf, overwrite);
+      else await writeOutput(file, buf);
       return { file, scope, url: cleanUrl(pg.url()) };
     },
 
@@ -805,14 +954,20 @@ export async function runDaemon(dir: string): Promise<void> {
           if (kind === "text" || kind === "text-gone") {
             // For text-gone a --within element that has vanished means its text is gone too.
             const scope = within ? (kind === "text" ? await locate(pg, within, "within") : refLocator(pg, within, "within").first()) : pg;
+            if (within && scope !== pg) await note("within", pg, scope as Locator, within);
             const found = scope.getByText(value).filter({ visible: true }).first();
             if (kind === "text-gone") wasPresent = (await found.count().catch(() => 0)) > 0;
             await found.waitFor({ state: kind === "text" ? "visible" : "detached", timeout });
-          } else if (kind === "ref") await (await locate(pg, value)).waitFor({ state: "visible", timeout });
+          } else if (kind === "ref") {
+            const loc = await locate(pg, value);
+            await note("target", pg, loc, value);
+            await loc.waitFor({ state: "visible", timeout });
+          }
           else if (kind === "ref-hidden") {
             // A ref that is no longer on the page (the spinner was removed) counts as hidden.
             const target = refLocator(pg, value, "value").first();
             wasPresent = await target.isVisible().catch(() => false);
+            if (wasPresent) await note("target", pg, target, value);
             await target.waitFor({ state: "hidden", timeout });
           } else {
             // Agents only ever see stripped URLs, so a glob may match the full URL or origin + path.
@@ -917,11 +1072,36 @@ export async function runDaemon(dir: string): Promise<void> {
       }
       const pg = await page();
       const loc = await locate(pg, ref);
+      // The log note comes first: the read-level check must sit right before the click (the link may change while it is described).
+      await note("target", pg, loc, ref);
       if (config.actions === "read") {
-        const reason = await loc.evaluate(clickBlockReason);
+        const reason = await clickBlockReason(loc);
         if (reason) throw blocked("This click", reason);
       }
-      await loc.click({ timeout: timeoutOf(p, ACTION_TIMEOUT_MS), clickCount: count, button, ...(modifiers.length ? { modifiers } : {}) });
+      // target=_blank: the new tab registers a moment after the click; wait briefly so `tabs` counts it.
+      const opensTab = await loc.evaluate((el) => el instanceof HTMLAnchorElement && el.target === "_blank", undefined, { timeout: 500 }).catch(() => false);
+      let popupSeen: Promise<unknown> | undefined;
+      let onPopup: ((opened: Page) => void) | undefined;
+      if (opensTab) {
+        popupSeen = new Promise<void>((resolveSeen) => {
+          onPopup = () => resolveSeen();
+          pg.once("popup", onPopup);
+        });
+      }
+      try {
+        await loc.click({ timeout: timeoutOf(p, ACTION_TIMEOUT_MS), clickCount: count, button, ...(modifiers.length ? { modifiers } : {}) });
+        if (popupSeen) await Promise.race([popupSeen, sleep(capWait(500))]);
+      } catch (err) {
+        // The click may have started a navigation that never gets an answer: do not leave the page stuck behind it.
+        if ((err as Error)?.name === "TimeoutError") {
+          await releasePage(pg);
+          // Not retryable: the click (a form submit, say) may have been sent before the answer failed to arrive.
+          throw timeoutError("click", p, snapshotCmd);
+        }
+        throw err;
+      } finally {
+        if (onPopup) pg.off("popup", onPopup);
+      }
       await pg.waitForLoadState("domcontentloaded", { timeout: capWait(5000) }).catch(() => {});
       return {
         ...(await location(pg)),
@@ -934,7 +1114,9 @@ export async function runDaemon(dir: string): Promise<void> {
     },
     async hover(p) {
       const ref = reqStr(p, "ref", "ref");
-      const loc = await locate(await page(), ref);
+      const pg = await page();
+      const loc = await locate(pg, ref);
+      await note("target", pg, loc, ref);
       await loc.hover({ timeout: timeoutOf(p, ACTION_TIMEOUT_MS) });
       return { ref };
     },
@@ -943,7 +1125,9 @@ export async function runDaemon(dir: string): Promise<void> {
       const value = optStr(p, "value", "value");
       if (value === undefined) throw new HoundError("MISSING_REQUIRED_FLAG", "--value is required.", { field: "value" });
       if (config.actions === "read") throw blocked("fill");
-      const loc = await locate(await page(), ref);
+      const pg = await page();
+      const loc = await locate(pg, ref);
+      await note("target", pg, loc, ref);
       try {
         await loc.fill(value, { timeout: timeoutOf(p, ACTION_TIMEOUT_MS) });
       } catch (err) {
@@ -966,7 +1150,8 @@ export async function runDaemon(dir: string): Promise<void> {
         throw new HoundError("MISSING_REQUIRED_FLAG", "--option is required (one or more strings).", { field: "option" });
       }
       if (config.actions === "read") throw blocked("select");
-      const loc = await locate(await page(), ref);
+      const pg = await page();
+      const loc = await locate(pg, ref);
       // Fail fast on an option that does not exist instead of waiting out the action timeout.
       const available = await loc.evaluate((el) =>
         el instanceof HTMLSelectElement ? Array.from(el.options).map((o) => ({ value: o.value, label: o.label })) : null,
@@ -983,6 +1168,7 @@ export async function runDaemon(dir: string): Promise<void> {
           retryable: true,
         });
       }
+      await note("target", pg, loc, ref);
       const selected = await loc.selectOption(options as string[], { timeout: timeoutOf(p, ACTION_TIMEOUT_MS) });
       return { ref, selected };
     },
@@ -991,8 +1177,21 @@ export async function runDaemon(dir: string): Promise<void> {
       const ref = optStr(p, "ref", "ref");
       if (config.actions === "read") throw blocked("press");
       const pg = await page();
-      if (ref) await (await locate(pg, ref)).press(key, { timeout: timeoutOf(p, ACTION_TIMEOUT_MS) });
-      else await pg.keyboard.press(key);
+      try {
+        if (ref) {
+          const loc = await locate(pg, ref);
+          await note("target", pg, loc, ref);
+          await loc.press(key, { timeout: timeoutOf(p, ACTION_TIMEOUT_MS) });
+        }
+        else await pg.keyboard.press(key);
+      } catch (err) {
+        // Enter on a form may have started a navigation that never gets an answer (see click).
+        if ((err as Error)?.name === "TimeoutError") {
+          await releasePage(pg);
+          throw timeoutError("press", p, snapshotCmd);
+        }
+        throw err;
+      }
       await pg.waitForLoadState("domcontentloaded", { timeout: capWait(5000) }).catch(() => {});
       return { ...(await location(pg)), key };
     },
@@ -1016,7 +1215,9 @@ export async function runDaemon(dir: string): Promise<void> {
       }
       if (config.actions === "read") throw blocked("type");
       const timeout = timeoutOf(p, typingTimeoutMs(value.length, delay));
-      const loc = await locate(await page(), ref);
+      const pg = await page();
+      const loc = await locate(pg, ref);
+      await note("target", pg, loc, ref);
       try {
         if (p.clear === true) {
           try {
@@ -1055,6 +1256,8 @@ export async function runDaemon(dir: string): Promise<void> {
       const t0 = Date.now();
       const left = () => Math.max(1, timeout - (Date.now() - t0));
       const isInput = await loc.evaluate((el) => el instanceof HTMLInputElement && el.type === "file");
+      await note("target", pg, loc, ref);
+      if (opNotes) opNotes.fileInput = isInput;
       try {
         if (isInput) await loc.setInputFiles(paths, { timeout });
         else {
@@ -1093,11 +1296,12 @@ export async function runDaemon(dir: string): Promise<void> {
     async download(p) {
       const ref = reqStr(p, "ref", "ref");
       const output = await outputPath(p);
-      const overwrite = optEnum(p, "ifExists", "if-exists", ["error", "overwrite"] as const) === "overwrite";
+      const overwrite = overwriteFlag(p);
       const pg = await page();
       const loc = await locate(pg, ref);
+      await note("target", pg, loc, ref);
       if (config.actions === "read") {
-        const reason = await loc.evaluate(clickBlockReason);
+        const reason = await clickBlockReason(loc);
         if (reason) throw blocked("This download", reason);
       }
       const asked = optInt(p, "timeoutMs", "timeout", 1, 600_000) ?? DOWNLOAD_TIMEOUT_MS;
@@ -1123,9 +1327,15 @@ export async function runDaemon(dir: string): Promise<void> {
       if ("d" in first) dl = first.d;
       else if (first.c) {
         waiter.cancel();
+        if ((first.c.error as Error)?.name === "TimeoutError") {
+          await releasePage(pg);
+          throw timeoutError("download", p, snapshotCmd);
+        }
         throw first.c.error;
       } else dl = await waiter.promise;
       if (!dl) {
+        // No bytes ever came: the click's navigation may still be pending and would block the next ops.
+        await releasePage(pg);
         throw new HoundError("TIMEOUT", `No download started within ${formatSeconds(asked)} after clicking "${ref}"; the click may have done something else; run page snapshot before retrying.`, {
           field: "ref",
           received: ref,
@@ -1154,6 +1364,71 @@ export async function runDaemon(dir: string): Promise<void> {
         // delete() waits for the download to finish and has no timeout of its own: never await it.
         void dl.delete().catch(() => {});
       }
+    },
+
+    async check(p) {
+      const ref = reqStr(p, "ref", "ref");
+      const want = p.checked;
+      if (typeof want !== "boolean") throw new HoundError("INVALID_ARGUMENT", "checked must be true or false.", { field: "checked", received: typeof want });
+      if (config.actions === "read") throw blocked(want ? "check" : "uncheck");
+      const pg = await page();
+      const loc = await locate(pg, ref);
+      const timeout = timeoutOf(p, ACTION_TIMEOUT_MS);
+      const kind = await loc.evaluate((el) => {
+        const role = (el.getAttribute("role") ?? "").trim().toLowerCase().split(/\s+/)[0] ?? "";
+        if (el instanceof HTMLInputElement && (el.type === "checkbox" || el.type === "radio")) return role === "switch" ? "switch" : el.type;
+        return role === "checkbox" || role === "radio" || role === "switch" ? role : null;
+      });
+      if (!kind) {
+        throw new HoundError("INVALID_ARGUMENT", `Element "${ref}" is not a checkbox, radio button or switch (<input type=checkbox|radio>, or role checkbox, radio or switch); use click instead.`, {
+          field: "ref",
+          received: ref,
+          retryable: true,
+        });
+      }
+      await note("target", pg, loc, ref);
+      const before = await loc.isChecked({ timeout });
+      if (before === want) return { ref, checked: before, changed: false };
+      if (kind === "radio" && !want) {
+        throw new HoundError("INVALID_ARGUMENT", `Element "${ref}" is a radio button: it cannot be unchecked; check another radio button of its group instead.`, { field: "ref", received: ref, retryable: true });
+      }
+      try {
+        await loc.setChecked(want, { timeout });
+      } catch (err) {
+        if (/did not change its state|state was not changed/i.test(firstLine(err))) {
+          throw new HoundError("CONFLICT", `The page did not let "${ref}" be ${want ? "checked" : "unchecked"} (its state did not change after the click).`, { field: "ref", received: ref, retryable: false, suggestedFix: snapshotCmd });
+        }
+        throw err;
+      }
+      const after = await loc.isChecked({ timeout: capWait(2000) }).catch(() => want);
+      return { ref, checked: after, changed: after !== before };
+    },
+
+    async pdf(p) {
+      const format = optEnum(p, "format", "format", PDF_FORMATS) ?? "A4";
+      const landscape = p.landscape === true;
+      const background = p.background === true;
+      const output = await outputPath(p);
+      const overwrite = overwriteFlag(p);
+      if (config.display === "headed") {
+        throw new HoundError("CONFLICT", "page pdf needs a headless session: Chromium cannot print to PDF while its window is shown. Reopen the session without --display headed.", {
+          field: "display",
+          received: "headed",
+          allowed: ["headless"],
+          retryable: false,
+          suggestedFix: `hound browser close --session-name ${name} --json && hound browser open --session-name ${name}${config.profile ? ` --profile ${config.profile}` : ""} --display headless --json`,
+        });
+      }
+      const pg = await page();
+      const buf = await within(pg.pdf({ format, landscape, printBackground: background }), timeoutOf(p, NAV_TIMEOUT_MS), () =>
+        new HoundError("TIMEOUT", "Timed out while printing the page to PDF. Retry, or raise --timeout.", { field: "timeout", retryable: true }),
+      );
+      const file = output ?? join(await runsDir(), `page-${stamp()}.pdf`);
+      if (output) await writeOutputSafe(output, buf, overwrite);
+      else await writeOutput(file, buf);
+      // Best effort: Chromium writes one "/Type /Page" object per page.
+      const pages = buf.toString("latin1").match(/\/Type\s*\/Page(?![A-Za-z])/g)?.length ?? 0;
+      return { file, bytes: buf.length, url: cleanUrl(pg.url()), format, landscape, background, ...(pages > 0 ? { pages } : {}) };
     },
 
     async resize(p) {
@@ -1199,14 +1474,39 @@ export async function runDaemon(dir: string): Promise<void> {
     async drag(p) {
       const ref = reqStr(p, "ref", "ref");
       const toRef = reqStr(p, "toRef", "to-ref");
+      const method = optEnum(p, "method", "method", DRAG_METHODS) ?? "auto";
+      const steps = optInt(p, "steps", "steps", DRAG_STEPS_MIN, DRAG_STEPS_MAX) ?? DRAG_STEPS_DEFAULT;
       if (ref === toRef) throw new HoundError("INVALID_ARGUMENT", "--ref and --to-ref are the same element.", { field: "to-ref", received: toRef });
       if (config.actions === "read") throw blocked("drag");
       const pg = await page();
       const source = await locate(pg, ref);
       const target = await locate(pg, toRef, "to-ref");
-      await source.dragTo(target, { timeout: timeoutOf(p, ACTION_TIMEOUT_MS) });
+      await note("target", pg, source, ref);
+      await note("to", pg, target, toRef);
+      const timeout = timeoutOf(p, ACTION_TIMEOUT_MS);
+      let used: "html5" | "mouse" = method === "mouse" ? "mouse" : "html5";
+      let fellBack = false;
+      if (method === "mouse") await mouseDrag(pg, source, target, steps, timeout);
+      else if (method === "html5") await source.dragTo(target, { timeout });
+      else {
+        // auto: Playwright's dragTo (HTML5 drag-and-drop, one pointer move) first; when the page did not react, or dragTo
+        // failed, repeat with a real pointer path for libraries that need intermediate moves.
+        const spy = await watchDrag(pg, source);
+        let failed: unknown;
+        try {
+          await source.dragTo(target, { timeout });
+        } catch (err) {
+          if ((err as Error)?.name === "TimeoutError" || isHoundError(err)) throw err;
+          failed = err;
+        }
+        if (failed !== undefined || !(await spy.changed())) {
+          fellBack = true;
+          used = "mouse";
+          await mouseDrag(pg, source, target, steps, capWait(timeout));
+        }
+      }
       await pg.waitForLoadState("domcontentloaded", { timeout: capWait(5000) }).catch(() => {});
-      return { ...(await location(pg)), ref, toRef, tabs: context.pages().length };
+      return { ...(await location(pg)), ref, toRef, tabs: context.pages().length, method: used, ...(fellBack ? { fellBack } : {}) };
     },
 
     async find(p) {
@@ -1235,12 +1535,14 @@ export async function runDaemon(dir: string): Promise<void> {
       if (compiled && budget < 100) throw new HoundError("TIMEOUT", "Timed out before the --regex scan could start; raise --timeout.", { field: "timeout", retryable: true });
       const hits = compiled ? await matchRegex(lines, compiled.source, compiled.flags, budget) : matchText(lines, text!);
       const shown = hits.slice(0, limit);
+      // Matching used the raw lines; what is returned has one-time codes after a code label and card numbers masked.
+      const safe = redactFindLines(lines);
       const tidy = (l: string | undefined) => clamp((l ?? "").trim(), 300);
       const matches = shown.map((i) => {
-        const raw = lines[i] ?? "";
+        const raw = safe[i] ?? "";
         const ref = /\[ref=([a-z0-9]{1,32})\]/i.exec(raw)?.[1];
-        const before = context > 0 ? lines.slice(Math.max(0, i - context), i).map(tidy) : undefined;
-        const after = context > 0 ? lines.slice(i + 1, i + 1 + context).map(tidy) : undefined;
+        const before = context > 0 ? safe.slice(Math.max(0, i - context), i).map(tidy) : undefined;
+        const after = context > 0 ? safe.slice(i + 1, i + 1 + context).map(tidy) : undefined;
         return { line: i + 1, ...(ref ? { ref } : {}), text: tidy(raw), ...(before ? { before } : {}), ...(after ? { after } : {}) };
       });
       const truncated = hits.length > shown.length;
@@ -1277,7 +1579,24 @@ export async function runDaemon(dir: string): Promise<void> {
             const v = live ? (el as HTMLInputElement).value : el.getAttribute(name);
             return { tag, sensitive, attr: v === null ? null : v.slice(0, cap as number), text: "" };
           }
-          return { tag, sensitive, attr: null, text: ((el as HTMLElement).innerText ?? el.textContent ?? "").slice(0, cap as number) };
+          // What the element and its surroundings say about themselves: decides how much of its text is masked (never returned).
+          const bits: string[] = [];
+          const add = (v: string | null | undefined) => {
+            if (v) bits.push(v.slice(0, 100));
+          };
+          const describe = (e: Element) => [e.id, e.getAttribute("name"), e.getAttribute("aria-label"), e.getAttribute("data-testid"), e.getAttribute("placeholder"), e.getAttribute("autocomplete"), e.getAttribute("title"), typeof e.className === "string" ? e.className : ""];
+          describe(el).forEach(add);
+          const by = el.getAttribute("aria-labelledby");
+          if (by) by.split(/\s+/).slice(0, 3).forEach((id) => add(document.getElementById(id)?.textContent));
+          // The label just before the element ("Verification code" above its value): short and without digits, so a neighbouring paragraph is not a label.
+          const before = el.previousElementSibling?.textContent?.trim() ?? "";
+          if (before.length > 0 && before.length <= 60 && !/\d/.test(before)) add(before);
+          let up: Element | null = el.parentElement;
+          for (let i = 0; i < 3 && up && up !== document.body && up !== document.documentElement; i++, up = up.parentElement) {
+            [up.id, up.getAttribute("aria-label"), up.getAttribute("data-testid"), typeof up.className === "string" ? up.className : ""].forEach(add);
+          }
+          const hints = bits.join(" ").slice(0, 800);
+          return { tag, sensitive, attr: null, text: ((el as HTMLElement).innerText ?? el.textContent ?? "").slice(0, cap as number), hints };
         },
         [attr ?? null, READ_SCAN_MAX_CHARS, [...PASSWORD_SAFE_ATTRS], SENSITIVE_HINT] as const,
         { timeout: timeoutOf(p, ACTION_TIMEOUT_MS) },
@@ -1290,7 +1609,7 @@ export async function runDaemon(dir: string): Promise<void> {
         const clean = redactAttr(attr, facts.attr);
         return { ref, attr, value: clean.slice(0, limit), chars: clean.length, truncated: clean.length > limit };
       }
-      const clean = scrubTokens(facts.text);
+      const clean = redactReadText(facts.text, facts.hints ?? "");
       return { ref, text: clean.slice(0, limit), chars: clean.length, truncated: clean.length > limit };
     },
 
@@ -1320,7 +1639,7 @@ export async function runDaemon(dir: string): Promise<void> {
       const part = reqEnum(p, "part", "part", ["request-body", "response-body"] as const);
       const limit = optInt(p, "limitChars", "limit-chars", 1, 200_000) ?? 8000;
       const output = await outputPath(p);
-      const overwrite = optEnum(p, "ifExists", "if-exists", ["error", "overwrite"] as const) === "overwrite";
+      const overwrite = overwriteFlag(p);
       const req = requestBuffer.get(index);
       if (!req) {
         throw new HoundError("INVALID_ARGUMENT", `No request with index ${index} is available: unknown, or older than the last ${REQUEST_BUFFER_CAP} requests of this session.`, {
@@ -1359,7 +1678,8 @@ export async function runDaemon(dir: string): Promise<void> {
         headerType = req.headers()["content-type"];
       } else {
         if (req.failure()) {
-          throw new HoundError("NETWORK_ERROR", `Request ${index} failed before any response arrived, so it has no response body.`, { field: "index", received: index, retryable: false });
+          const why = blockedRequests.get(req);
+          throw new HoundError("NETWORK_ERROR", why ? `Request ${index} was blocked by --block ${why}, so it has no response body.` : `Request ${index} failed before any response arrived, so it has no response body.`, { field: "index", received: index, retryable: false });
         }
         const res = await within(req.response(), timeout, slow);
         if (!res) {
@@ -1435,6 +1755,24 @@ export async function runDaemon(dir: string): Promise<void> {
       };
     },
 
+    async actions(p) {
+      const includeQuery = p.includeQuery === true;
+      const session = {
+        name,
+        ...(config.profile ? { profile: config.profile } : {}),
+        actions: config.actions,
+        dialog: dialogDefault,
+        ...(config.viewport ? { viewport: config.viewport } : {}),
+        ...(config.mobile ? { mobile: true } : {}),
+        ...(config.deviceScaleFactor ? { deviceScaleFactor: config.deviceScaleFactor } : {}),
+        ...(config.locale ? { locale: config.locale } : {}),
+        ...(config.timezone ? { timezone: config.timezone } : {}),
+        ...(config.geolocation ? { geolocation: config.geolocation } : {}),
+        ...(blockList.length ? { block: [...blockList] } : {}),
+      };
+      return { session, ...actionLog.export(includeQuery) };
+    },
+
     async "trace-export"() {
       if (config.trace !== "on") {
         throw new HoundError("INVALID_ARGUMENT", "This session was not opened with --trace on.", {
@@ -1505,7 +1843,11 @@ export async function runDaemon(dir: string): Promise<void> {
       }
       const t0 = Date.now();
       currentDeadline = deadline;
+      const recording = isRecorded(op, params);
+      const hrefBefore = recording && !active.isClosed() ? active.url() : "";
       try {
+        opNotes = recording ? {} : undefined;
+        opIsForm = op === "fill" || op === "type" || op === "select" || op === "press" || op === "check" || op === "upload";
         const { explicit, ...chosen } = dialogPolicy(op, params);
         opPolicy = explicit ? chosen : undefined;
         opLeaves = op === "navigate" || op === "back" || op === "forward" || op === "reload" || (op === "tabs" && params.action === "close");
@@ -1516,6 +1858,13 @@ export async function runDaemon(dir: string): Promise<void> {
         }
         const result = await fn(params);
         if (opDialogs.length > 0 && result && typeof result === "object") (result as { dialogs?: DialogEntry[] }).dialogs = opDialogs;
+        if (recording && opNotes) {
+          try {
+            actionLog.record(op, params, result, opNotes, hrefBefore, active.isClosed() ? "" : active.url());
+          } catch {
+            // the log is best effort: it never fails an op
+          }
+        }
         log(`op=${op} ms=${Date.now() - t0} ok`);
         if (op === "close") {
           pending--;
@@ -1530,6 +1879,7 @@ export async function runDaemon(dir: string): Promise<void> {
         reply({ id, ok: false, error: herr.toJSON() });
       } finally {
         currentDeadline = undefined;
+        opNotes = undefined;
         if (opPolicy) graceOp = { op, policy: opPolicy, until: Date.now() + DIALOG_GRACE_MS };
         opPolicy = undefined;
         opLeaves = false;
